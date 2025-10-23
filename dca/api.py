@@ -1,4 +1,5 @@
-import os, tempfile, shutil, random
+import os
+import random
 import anndata
 import numpy as np
 import scanpy as sc
@@ -177,9 +178,6 @@ def dca(adata,
         'init': init
     }
     
-    from tensorflow.python.framework.ops import disable_eager_execution
-    disable_eager_execution()
-
     input_size = output_size = adata.n_vars
     net = AE_types[ae_type](input_size=input_size,
                             output_size=output_size,

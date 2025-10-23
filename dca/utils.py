@@ -4,15 +4,11 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import scipy as sp
-import tensorflow as tf
-from tensorflow.contrib.opt import ScipyOptimizerInterface
-
+from scipy.optimize import minimize
 
 nb_zero = lambda t, mu: (t/(mu+t))**t
 zinb_zero = lambda t, mu, p: p + ((1.-p)*((t/(mu+t))**t))
 sigmoid = lambda x: 1. / (1.+np.exp(-x))
-logit = lambda x: np.log(x + 1e-7) - np.log(1. - x + 1e-7)
-tf_logit = lambda x: tf.cast(tf.log(x + 1e-7) - tf.log(1. - x + 1e-7), 'float32')
 log_loss = lambda pred, label: np.sum(-(label*np.log(pred+1e-7)) - ((1.-label)*np.log(1.-pred+1e-7)))
 
 
@@ -35,39 +31,27 @@ def _fitquad(x, y):
     #print('Coefs:', coef)
     return np.array([coef[0], 1, 0]), r2
 
-
-def _tf_zinb_zero(mu, t=None):
-    a, b = tf.Variable([-1.0], dtype='float32'), tf.Variable([0.0], dtype='float32')
-
-    if t is None:
-        t_log = tf.Variable([-10.], dtype='float32')
-        t = tf.exp(t_log)
-
-    p = tf.sigmoid((tf.log(mu+1e-7)*a) + b)
-    pred = p + ((1.-p)*((t/(mu+t))**t))
-    pred = tf.cast(pred, 'float32')
-    return pred, a, b, t
-
+def _predict_zinb(mu, params):
+    a, b, log_t = params
+    t = np.exp(log_t)
+    p = sigmoid((np.log(mu + 1e-7) * a) + b)
+    pred = p + ((1. - p) * ((t / (mu + t)) ** t))
+    return pred, t
 
 def _optimize_zinb(mu, dropout, theta=None):
-    pred, a, b, t = _tf_zinb_zero(mu, theta)
-    #loss = tf.reduce_mean(tf.abs(tf_logit(pred) - tf_logit(dropout)))
-    loss = tf.losses.log_loss(labels=dropout.astype('float32'),
-                              predictions=pred)
+    mu = np.asarray(mu, dtype=np.float64)
+    y = np.asarray(dropout, dtype=np.float64)
+    x0 = np.array([-1.0, 0.0, np.log(theta) if theta is not None else -10.0], dtype=np.float64)
+    bounds = [(-10.0, 10.0), (-10.0, 10.0), (np.log(1e-3), np.log(1e4))]
 
-    optimizer = ScipyOptimizerInterface(loss, options={'maxiter': 100})
+    def objective(p):
+        pred, _ = _predict_zinb(mu, p)
+        return -np.sum(y * np.log(pred + 1e-7) + (1.0 - y) * np.log(1.0 - pred + 1e-7))
 
-    with tf.Session() as sess:
-        sess.run(tf.global_variables_initializer())
-        optimizer.minimize(sess)
-        ret_a = sess.run(a)
-        ret_b = sess.run(b)
-        if theta is None:
-            ret_t = sess.run(t)
-        else:
-            ret_t = t
-
-    return ret_a, ret_b, ret_t
+    res = minimize(objective, x0, method="L-BFGS-B", bounds=bounds, options={"maxiter": 200})
+    a, b, log_t = res.x
+    t = float(np.exp(log_t))
+    return float(a), float(b), t
 
 
 def plot_mean_dropout(ad, title, ax, opt_zinb_theta=False, legend_out=False):

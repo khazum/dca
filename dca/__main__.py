@@ -13,7 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 
-import os, sys, argparse
+import argparse
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Autoencoder')
@@ -148,7 +148,11 @@ def main():
                           ' at https://www.tensorflow.org/install/ to install'
                           ' it.')
 
-    # import tf and the rest after parse_args() to make argparse help faster
-    from . import train
+    # Defer heavy imports until after parsing for a faster --help
+    if args.hyper:
+        from . import hyper as _hyper
+        _hyper.hyper(args)
+    else:
+        from . import train as _train
+        _train.train_with_args(args)
 
-    train.train_with_args(args)

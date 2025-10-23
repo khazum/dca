@@ -1,32 +1,31 @@
-from keras.engine.topology import Layer
-from keras.layers import Lambda, Dense
-from keras.engine.base_layer import InputSpec
-from keras import backend as K
-import tensorflow as tf
-
+# dca_patched/dca/layers.py
+from tensorflow.keras.layers import Layer, Lambda, Dense, InputSpec
+from tensorflow.keras import ops
 
 class ConstantDispersionLayer(Layer):
-    '''
-        An identity layer which allows us to inject extra parameters
-        such as dispersion to Keras models
-    '''
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
+    """
+    Identity layer that carries a trainable dispersion parameter.
+    """
     def build(self, input_shape):
-        self.theta = self.add_weight(shape=(1, input_shape[1]),
-                                     initializer='zeros',
-                                     trainable=True,
-                                     name='theta')
-        self.theta_exp = tf.clip_by_value(K.exp(self.theta), 1e-3, 1e4)
+        self.theta = self.add_weight(
+            shape=(1, input_shape[1]),
+            initializer="zeros",
+            trainable=True,
+            name="theta",
+        )
         super().build(input_shape)
 
     def call(self, x):
-        return tf.identity(x)
-
+        # Identity pass-through; dispersion is exposed via trainable weights.
+        return x
+    
     def compute_output_shape(self, input_shape):
         return input_shape
 
+    @property
+    def theta_exp(self):
+        # Compute on-the-fly so it always reflects current weights.
+        return ops.clip(ops.exp(self.theta), 1e-3, 1e4)
 
 class SliceLayer(Layer):
     def __init__(self, index, **kwargs):
@@ -35,12 +34,11 @@ class SliceLayer(Layer):
 
     def build(self, input_shape):
         if not isinstance(input_shape, list):
-            raise ValueError('Input should be a list')
-
+            raise ValueError("Input should be a list")
         super().build(input_shape)
 
     def call(self, x):
-        assert isinstance(x, list), 'SliceLayer input is not a list'
+        assert isinstance(x, list), "SliceLayer input is not a list"
         return x[self.index]
 
     def compute_output_shape(self, input_shape):
@@ -53,33 +51,35 @@ class ElementwiseDense(Dense):
         input_dim = input_shape[-1]
         assert (input_dim == self.units) or (self.units == 1), \
                "Input and output dims are not compatible"
-
-        # shape=(input_units, ) makes this elementwise bcs of broadcasting
-        self.kernel = self.add_weight(shape=(self.units,),
-                                      initializer=self.kernel_initializer,
-                                      name='kernel',
-                                      regularizer=self.kernel_regularizer,
-                                      constraint=self.kernel_constraint)
+        self.kernel = self.add_weight(
+            shape=(self.units,),
+            initializer=self.kernel_initializer,
+            name="kernel",
+            regularizer=self.kernel_regularizer,
+            constraint=self.kernel_constraint,
+        )
         if self.use_bias:
-            self.bias = self.add_weight(shape=(self.units,),
-                                        initializer=self.bias_initializer,
-                                        name='bias',
-                                        regularizer=self.bias_regularizer,
-                                        constraint=self.bias_constraint)
+            self.bias = self.add_weight(
+                shape=(self.units,),
+                initializer=self.bias_initializer,
+                name="bias",
+                regularizer=self.bias_regularizer,
+                constraint=self.bias_constraint,
+            )
         else:
             self.bias = None
         self.input_spec = InputSpec(min_ndim=2, axes={-1: input_dim})
         self.built = True
 
     def call(self, inputs):
-        # use * instead of tf.matmul, we need broadcasting here
-        output = inputs * self.kernel
+        out = inputs * self.kernel  # broadcasting
         if self.use_bias:
-            output = output + self.bias
+            out = out + self.bias
         if self.activation is not None:
-            output = self.activation(output)
-        return output
+            out = self.activation(out)
+        return out
 
 
-nan2zeroLayer = Lambda(lambda x: tf.where(tf.is_nan(x), tf.zeros_like(x), x))
-ColwiseMultLayer = Lambda(lambda l: l[0]*tf.reshape(l[1], (-1,1)))
+# Keras-ops lambdas (no tf.*)
+nan2zeroLayer = Lambda(lambda x: ops.nan_to_num(x))
+ColwiseMultLayer = Lambda(lambda l: ops.multiply(l[0], ops.reshape(l[1], (-1, 1))))
