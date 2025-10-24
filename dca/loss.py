@@ -23,22 +23,18 @@ def mse_loss(y_true, y_pred):
 # similar to those of Keras objective functions so that
 # later on we can use them in Keras smoothly:
 # https://github.com/fchollet/keras/blob/master/keras/objectives.py#L7
-def poisson_loss(y_true, y_pred):
+def poisson_loss(y_true, y_pred, mean=True):
     y_pred = ops.cast(y_pred, "float32")
     y_true = ops.cast(y_true, "float32")
 
-    # we can use the Possion PMF from TensorFlow as well
-    # dist = tf.contrib.distributions
-    # return -tf.reduce_mean(dist.Poisson(y_pred).log_pmf(y_true))
-
-    nelem = _nelem(y_true)
     y_true = ops.nan_to_num(y_true)
-
-    # last term can be avoided since it doesn't depend on y_pred
-    # however keeping it gives a nice lower bound to zero
+    # elementwise Poisson NLL
     ret = y_pred - y_true * ops.log(y_pred + 1e-10) + lgamma(y_true + 1.0)
-
-    return ops.divide_no_nan(ops.sum(ret), nelem)
+    if mean:
+        nelem = _nelem(y_true)
+        return ops.divide_no_nan(ops.sum(ret), nelem)
+    else:
+        return ret
 
 
 # We need a class (or closure) here,
