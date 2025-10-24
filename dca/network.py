@@ -24,6 +24,7 @@ from tensorflow.keras.models import Model
 from tensorflow.keras.regularizers import l1_l2
 from tensorflow.keras.losses import MeanSquaredError
 from tensorflow.keras import ops
+import numpy as np
 
 from .loss import poisson_loss, NB, ZINB
 from .layers import (
@@ -159,7 +160,7 @@ class Autoencoder:
 
     def build_output(self):
 
-        self.loss = MeanSquaredError
+        self.loss = MeanSquaredError()
         mean = Dense(
             self.output_size,
             kernel_initializer=self.init,
@@ -221,12 +222,14 @@ class Autoencoder:
             print("dca: Calculating low dimensional representations...")
 
             sf = adata.obs.size_factors.values.reshape(-1, 1)
-            adata.obsm["X_dca"] = self.encoder.predict({"count": adata.X, "size_factors": sf})
+            X = adata.X.A if hasattr(adata.X, "A") else np.asarray(adata.X)
+            adata.obsm["X_dca"] = self.encoder.predict({"count": X, "size_factors": sf})
         if mode in ("denoise", "full"):
             print("dca: Calculating reconstructions...")
 
             sf = adata.obs.size_factors.values.reshape(-1, 1)
-            pred = self.model.predict({"count": adata.X, "size_factors": sf})
+            X = adata.X.A if hasattr(adata.X, "A") else np.asarray(adata.X)
+            pred = self.model.predict({"count": X, "size_factors": sf})
             # Some models (e.g., NB with conditional dispersion) pack [mu|theta] to y_pred.
             # If a layer named "pack" is present, split the features and keep mu only.
             if any(l.name == "pack" for l in self.model.layers):
@@ -394,9 +397,8 @@ class NBAutoencoder(Autoencoder):
         adata = res if copy else adata
 
         if return_info:
-            adata.obsm["X_dca_dispersion"] = self.extra_models["dispersion"].predict(
-                adata.X
-            )
+            X = adata.X.A if hasattr(adata.X, "A") else np.asarray(adata.X)
+            adata.obsm["X_dca_dispersion"] = self.extra_models["dispersion"].predict(X)
 
         return adata if copy else None
 
@@ -406,9 +408,9 @@ class NBAutoencoder(Autoencoder):
 
         super().write(adata, file_path, mode, colnames=colnames)
 
-        if "X_dca_dispersion" in adata.var_keys():
+        if "X_dca_dispersion" in adata.obsm_keys():
             write_text_matrix(
-                adata.var["X_dca_dispersion"].reshape(1, -1),
+                adata.obsm["X_dca_dispersion"],
                 os.path.join(file_path, "dispersion.tsv"),
                 colnames=colnames,
                 transpose=True,
@@ -497,10 +499,9 @@ class ZINBAutoencoder(Autoencoder):
         adata = adata.copy() if copy else adata
 
         if return_info:
-            adata.obsm["X_dca_dispersion"] = self.extra_models["dispersion"].predict(
-                adata.X
-            )
-            adata.obsm["X_dca_dropout"] = self.extra_models["pi"].predict(adata.X)
+            X = adata.X.A if hasattr(adata.X, "A") else np.asarray(adata.X)
+            adata.obsm["X_dca_dispersion"] = self.extra_models["dispersion"].predict(X)
+            adata.obsm["X_dca_dropout"] = self.extra_models["pi"].predict(X)
 
         # warning! this may overwrite adata.X
         super().predict(adata, mode, return_info, copy=False)

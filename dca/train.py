@@ -36,19 +36,21 @@ from tensorflow.keras import ops
 
 class WrappedLoss(Loss):
     def __init__(self, base_loss):
-        # Keras won't divide by batch size again
+        # Use "sum" so Keras doesn't apply an extra averaging step.
         super().__init__(reduction="sum", name="wrapped_dca_loss")
         self.base_loss = base_loss
 
     def call(self, y_true, y_pred):
+        """Return batch-mean of per-sample, per-gene losses.
+        Matches TF1 impl which averaged over *all* elements (B*G)."""
         try:
-            # Get per-gene loss and reduce to a scalar ourselves
             per_gene = self.base_loss(y_true, y_pred, mean=False)  # (B, G)
-            per_sample = ops.sum(per_gene, axis=-1)                  # (B,)
-            return ops.mean(per_sample)                              # scalar
         except TypeError:
-            # Base loss already returns a scalar: just use it as-is
-            return self.base_loss(y_true, y_pred)
+            # Fallback for built-in Keras losses without 'mean' arg (e.g., MSE)
+            per_gene = tf.math.squared_difference(y_true, y_pred)  # (B, G)
+        g = tf.cast(tf.shape(per_gene)[-1], per_gene.dtype)
+        per_sample = tf.reduce_sum(per_gene, axis=-1) / tf.maximum(g, 1.0)  # (B,)
+        return tf.reduce_mean(per_sample)  # scalar
 
 class PackedNBLoss(Loss):
     def __init__(self, eps=1e-10):
@@ -67,9 +69,10 @@ class PackedNBLoss(Loss):
         # Negative log-likelihood of NB (pure TF ops)
         t1 = tf.math.lgamma(theta + eps) + tf.math.lgamma(y_true + 1.0) - tf.math.lgamma(y_true + theta + eps)
         t2 = (theta + y_true) * tf.math.log1p(mu / (theta + eps)) + y_true * (tf.math.log(theta + eps) - tf.math.log(mu + eps))
-        per_gene   = t1 + t2                   # (B, G)
-        per_sample = tf.reduce_sum(per_gene, axis=-1)   # (B,)
-        return tf.reduce_mean(per_sample)      # scalar
+        per_gene = t1 + t2                                    # (B, G)
+        g = tf.cast(tf.shape(per_gene)[-1], per_gene.dtype)
+        per_sample = tf.reduce_sum(per_gene, axis=-1) / tf.maximum(g, 1.0)  # (B,)
+        return tf.reduce_mean(per_sample)                     # scalar
     
 def train(
     adata,
