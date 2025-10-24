@@ -1,5 +1,4 @@
 import magic
-import os
 
 scdata = magic.mg.SCData.from_csv("../data/chu/chu_original.csv", cell_axis="columns", data_type='sc-seq')
 scdata.run_magic()

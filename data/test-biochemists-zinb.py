@@ -1,4 +1,3 @@
-import numpy as np
 from autoencoder.io import read_text
 from autoencoder.network import MLP
 from keras.callbacks import TensorBoard

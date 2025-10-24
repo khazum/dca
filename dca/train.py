@@ -118,7 +118,7 @@ def train(
     else:
         loss_fn = WrappedLoss(network.loss)
 
-    model.compile(optimizer=optimizer, loss=loss_fn, run_eagerly=False, jit_compile=False)
+    model.compile(optimizer=optimizer, loss=loss_fn, run_eagerly=True, jit_compile=False)
 
     # Callbacks
     callbacks = []

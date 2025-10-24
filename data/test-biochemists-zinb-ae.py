@@ -1,6 +1,6 @@
 import numpy as np
 import tensorflow as tf
-from autoencoder.io import read_text, preprocess
+from autoencoder.io import read_text
 from autoencoder.api import autoencode
 import keras.backend as K
 

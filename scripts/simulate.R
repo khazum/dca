@@ -1,6 +1,8 @@
-# Warning! R 3.4 and Bioconductor 3.5 are required for splatter!
-# library(BiocInstaller)
-# biocLite('splatter')
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+if (!require("splatter", quietly = TRUE))
+    BiocManager::install("splatter")
+
 library(splatter) # requires splatter >= 1.2.0
 
 save.sim <- function(sim, dir) {

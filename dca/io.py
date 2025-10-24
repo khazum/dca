@@ -84,21 +84,38 @@ def read_dataset(adata, transpose=False, test_split=False, copy=False, check_cou
 
 
 def normalize(adata, filter_min_counts=True, size_factors=True, normalize_input=True, logtrans_input=True):
-
     if filter_min_counts:
         sc.pp.filter_genes(adata, min_counts=1)
         sc.pp.filter_cells(adata, min_counts=1)
 
+    # Keep a raw copy of counts prior to any normalization
     if size_factors or normalize_input or logtrans_input:
         adata.raw = adata.copy()
     else:
         adata.raw = adata
 
     if size_factors:
-        sc.pp.normalize_per_cell(adata)
-        adata.obs['size_factors'] = adata.obs.n_counts / np.median(adata.obs.n_counts)
+        # Compute per-cell library sizes (float) before normalization
+        if sp.sparse.issparse(adata.X):
+            n_counts = np.asarray(adata.X.sum(axis=1)).ravel()
+        else:
+            n_counts = np.asarray(adata.X.sum(axis=1)).ravel()
+        n_counts = n_counts.astype(np.float64, copy=False)
+        adata.obs['n_counts'] = n_counts
+
+        # Size factors: library size / median library size
+        adata.obs['size_factors'] = n_counts / np.median(n_counts)
+
+        # Ensure float dtype prior to per-cell scaling to avoid casting issues
+        adata.X = adata.X.astype(np.float32)
+
+        # Modern Scanpy normalization (replaces deprecated normalize_per_cell)
+        try:
+            sc.pp.normalize_total(adata, target_sum=1e4, inplace=True, key_added=None)
+        except TypeError:
+            sc.pp.normalize_total(adata, target_sum=1e4, inplace=True)
     else:
-        adata.obs['size_factors'] = 1.0
+        adata.obs['size_factors'] = np.ones(adata.n_obs, dtype=np.float32)
 
     if logtrans_input:
         sc.pp.log1p(adata)

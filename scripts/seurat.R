@@ -1,3 +1,10 @@
+if (!require("Seurat", quietly = TRUE))
+  install.packages('Seurat', quiet = TRUE)
+if (!require("ggplot2", quietly = TRUE))  
+  install.packages("ggplot2", quiet = TRUE)
+if (!require("Rtsne", quietly = TRUE))  
+  install.packages("Rtsne", quiet = TRUE)
+  
 suppressMessages(library(Seurat, quietly = T))
 suppressMessages(library(ggplot2, quietly = T))
 suppressMessages(library(Rtsne, quietly = T))
