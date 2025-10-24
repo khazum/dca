@@ -18,13 +18,12 @@ import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 import pickle
 import numpy as np
-from tensorflow import keras
-from tensorflow.keras.layers import Input, Dense, Dropout, Activation, BatchNormalization, Lambda
-from tensorflow.keras.models import Model
-from tensorflow.keras.regularizers import l1_l2
-from tensorflow.keras.losses import MeanSquaredError
-from tensorflow.keras import ops
-import numpy as np
+import keras
+from keras.layers import Input, Dense, Dropout, Activation, BatchNormalization, Lambda
+from keras.models import Model
+from keras.regularizers import l1_l2
+from keras.losses import MeanSquaredError
+from keras import ops
 
 from .loss import poisson_loss, NB, ZINB
 from .layers import (
@@ -221,26 +220,36 @@ class Autoencoder:
         if mode in ("latent", "full"):
             print("dca: Calculating low dimensional representations...")
 
-            sf = adata.obs.size_factors.values.reshape(-1, 1)
+            sf = adata.obs.size_factors.values.reshape(-1, 1).astype(np.float32)
             X = adata.X.A if hasattr(adata.X, "A") else np.asarray(adata.X)
-            adata.obsm["X_dca"] = self.encoder.predict({"count": X, "size_factors": sf})
+            adata.obsm["X_dca"] = self.encoder.predict([X, sf], batch_size=256, verbose=0)
         if mode in ("denoise", "full"):
             print("dca: Calculating reconstructions...")
 
-            sf = adata.obs.size_factors.values.reshape(-1, 1)
+            sf = adata.obs.size_factors.values.reshape(-1, 1).astype(np.float32)
             X = adata.X.A if hasattr(adata.X, "A") else np.asarray(adata.X)
-            pred = self.model.predict({"count": X, "size_factors": sf})
+            pred = self.model.predict([X, sf], batch_size=256, verbose=0)
             # Some models (e.g., NB with conditional dispersion) pack [mu|theta] to y_pred.
             # If a layer named "pack" is present, split the features and keep mu only.
             if any(l.name == "pack" for l in self.model.layers):
                 g = self.output_size
-                # Defensive check: last dim must be 2*g
-                if pred.shape[-1] != 2 * g:
+                n_features = pred.shape[-1]
+                
+                if n_features == g:
+                    # Not packed, just mu (e.g., Poisson)
+                    adata.X = pred
+                elif n_features == 2 * g:
+                    # NB model: [mu, theta]
+                    adata.X = pred[:, :g]  # Keep mu
+                elif n_features == 3 * g:
+                    # ZINB model: [mu, theta, pi]
+                    adata.X = pred[:, :g]  # Keep mu
+                else:
                     raise ValueError(
-                        f"Packed output width {pred.shape[-1]} != 2*output_size ({2*g})."
+                        f"Packed output width {n_features} is not 1, 2, or 3 times output_size ({g})."
                     )
-                adata.X = pred[:, :g]
             else:
+                # Non-packed models (e.g., 'normal' autoencoder)
                 adata.X = pred
         if mode == "latent":
             adata.X = adata.raw.X.copy()  # recover normalized expression values
@@ -397,8 +406,8 @@ class NBAutoencoder(Autoencoder):
         adata = res if copy else adata
 
         if return_info:
-            X = adata.X.A if hasattr(adata.X, "A") else np.asarray(adata.X)
-            adata.obsm["X_dca_dispersion"] = self.extra_models["dispersion"].predict(X)
+            X = adata.X.A if hasattr(adata.X, "A") else np.asarray(adata.X).astype(np.float32, copy=False)
+            adata.obsm["X_dca_dispersion"] = self.extra_models["dispersion"].predict(X, batch_size=256, verbose=0)
 
         return adata if copy else None
 
@@ -477,10 +486,17 @@ class ZINBAutoencoder(Autoencoder):
             name="mean",
         )(self.decoder_output)
         output = ColwiseMultLayer([mean, self.sf_layer])
-        output = SliceLayer(0, name="slice")([output, disp, pi])
+        
+        # Pack [mu, theta, pi] into the output
+        packed = keras.layers.Lambda(
+            lambda l: ops.concatenate([l[0], l[1], l[2]], axis=-1),
+            name="pack"  # name="pack" is important for dca/train.py
+        )([output, disp, pi])
+        
+        # Store ridge_lambda for the loss constructor in train.py
+        self.ridge_lambda_for_loss = self.ridge 
+        self.loss = None # This will be replaced in dca/train.py
 
-        zinb = ZINB(pi, theta=disp, ridge_lambda=self.ridge, debug=self.debug)
-        self.loss = zinb.loss
         self.extra_models["pi"] = Model(inputs=self.input_layer, outputs=pi)
         self.extra_models["dispersion"] = Model(inputs=self.input_layer, outputs=disp)
         self.extra_models["mean_norm"] = Model(inputs=self.input_layer, outputs=mean)
@@ -488,7 +504,7 @@ class ZINBAutoencoder(Autoencoder):
             inputs=self.input_layer, outputs=self.decoder_output
         )
 
-        self.model = Model(inputs=[self.input_layer, self.sf_layer], outputs=output)
+        self.model = Model(inputs=[self.input_layer, self.sf_layer], outputs=packed)
 
         self.encoder = self.get_encoder()
 
@@ -499,9 +515,9 @@ class ZINBAutoencoder(Autoencoder):
         adata = adata.copy() if copy else adata
 
         if return_info:
-            X = adata.X.A if hasattr(adata.X, "A") else np.asarray(adata.X)
-            adata.obsm["X_dca_dispersion"] = self.extra_models["dispersion"].predict(X)
-            adata.obsm["X_dca_dropout"] = self.extra_models["pi"].predict(X)
+            X = adata.X.A if hasattr(adata.X, "A") else np.asarray(adata.X).astype(np.float32, copy=False)
+            adata.obsm["X_dca_dispersion"] = self.extra_models["dispersion"].predict(X, batch_size=256, verbose=0)
+            adata.obsm["X_dca_dropout"] = self.extra_models["pi"].predict(X, batch_size=256, verbose=0)
 
         # warning! this may overwrite adata.X
         super().predict(adata, mode, return_info, copy=False)
@@ -553,7 +569,7 @@ class ZINBAutoencoderElemPi(ZINBAutoencoder):
         )(self.decoder_output)
 
         minus = Lambda(lambda x: -x)
-        mean_no_act = minus(mean_no_act)
+        mean_no_act_neg = minus(mean_no_act)
         pidim = self.output_size if not self.sharedpi else 1
 
         pi = ElementwiseDense(
@@ -562,23 +578,37 @@ class ZINBAutoencoderElemPi(ZINBAutoencoder):
             kernel_initializer=self.init,
             kernel_regularizer=maybe_l1_l2(self.l1_coef, self.l2_coef),
             name="pi",
-        )(mean_no_act)
+        )(mean_no_act_neg)
 
         mean = Activation(MeanAct, name="mean")(mean_no_act)
 
-        output = ColwiseMultLayer([mean, self.sf_layer])
-        output = SliceLayer(0, name="slice")([output, disp, pi])
+        # Handle sharedpi broadcast
+        if self.sharedpi:
+            pi_bcast = keras.layers.Lambda(
+                lambda t: t[0] * ops.ones_like(t[1]),  # (B,1) -> (B,G)
+                name="broadcast_pi"
+            )([pi, mean])
+        else:
+            pi_bcast = pi
 
-        zinb = ZINB(pi, theta=disp, ridge_lambda=self.ridge, debug=self.debug)
-        self.loss = zinb.loss
-        self.extra_models["pi"] = Model(inputs=self.input_layer, outputs=pi)
+        output = ColwiseMultLayer([mean, self.sf_layer]) # mu
+
+        packed = keras.layers.Lambda(
+            lambda l: ops.concatenate([l[0], l[1], l[2]], axis=-1),
+            name="pack"
+        )([output, disp, pi_bcast]) # pi_bcast is (B, G)
+
+        self.ridge_lambda_for_loss = self.ridge 
+        self.loss = None
+
+        self.extra_models["pi"] = Model(inputs=self.input_layer, outputs=pi) # Original pi
         self.extra_models["dispersion"] = Model(inputs=self.input_layer, outputs=disp)
         self.extra_models["mean_norm"] = Model(inputs=self.input_layer, outputs=mean)
         self.extra_models["decoded"] = Model(
             inputs=self.input_layer, outputs=self.decoder_output
         )
 
-        self.model = Model(inputs=[self.input_layer, self.sf_layer], outputs=output)
+        self.model = Model(inputs=[self.input_layer, self.sf_layer], outputs=packed)
 
         self.encoder = self.get_encoder()
 
@@ -609,11 +639,27 @@ class ZINBSharedAutoencoder(ZINBAutoencoder):
             kernel_regularizer=maybe_l1_l2(self.l1_coef, self.l2_coef),
             name="mean",
         )(self.decoder_output)
-        output = ColwiseMultLayer([mean, self.sf_layer])
-        output = SliceLayer(0, name="slice")([output, disp, pi])
+        
+        # Need to broadcast pi and disp from (B, 1) to (B, G)
+        pi_bcast = keras.layers.Lambda(
+            lambda t: t[0] * ops.ones_like(t[1]),
+            name="broadcast_pi"
+        )([pi, mean])
+        disp_bcast = keras.layers.Lambda(
+            lambda t: t[0] * ops.ones_like(t[1]),
+            name="broadcast_disp"
+        )([disp, mean])
 
-        zinb = ZINB(pi, theta=disp, ridge_lambda=self.ridge, debug=self.debug)
-        self.loss = zinb.loss
+        output = ColwiseMultLayer([mean, self.sf_layer]) # mu
+
+        packed = keras.layers.Lambda(
+            lambda l: ops.concatenate([l[0], l[1], l[2]], axis=-1),
+            name="pack"
+        )([output, disp_bcast, pi_bcast])
+
+        self.ridge_lambda_for_loss = self.ridge 
+        self.loss = None
+        
         self.extra_models["pi"] = Model(inputs=self.input_layer, outputs=pi)
         self.extra_models["dispersion"] = Model(inputs=self.input_layer, outputs=disp)
         self.extra_models["mean_norm"] = Model(inputs=self.input_layer, outputs=mean)
@@ -621,8 +667,7 @@ class ZINBSharedAutoencoder(ZINBAutoencoder):
             inputs=self.input_layer, outputs=self.decoder_output
         )
 
-        self.model = Model(inputs=[self.input_layer, self.sf_layer], outputs=output)
-
+        self.model = Model(inputs=[self.input_layer, self.sf_layer], outputs=packed)
         self.encoder = self.get_encoder()
 
 
@@ -646,13 +691,26 @@ class ZINBConstantDispAutoencoder(Autoencoder):
         )(self.decoder_output)
 
         # NB dispersion layer
-        disp = ConstantDispersionLayer(name="dispersion")
-        mean = disp(mean)
+        disp_layer = ConstantDispersionLayer(name="dispersion")
+        mean_with_disp = disp_layer(mean) # Call to build layer
+        theta = disp_layer.theta_exp     # This is symbolic (1, G)
 
-        output = ColwiseMultLayer([mean, self.sf_layer])
+        # Need to broadcast theta to (B, G) at call time
+        theta_bcast = keras.layers.Lambda(
+            lambda t: t[0] * ops.ones_like(t[1]),  # (1,G) -> (B,G)
+            name="broadcast_theta"
+        )([theta, mean])
 
-        zinb = ZINB(pi, theta=disp.theta_exp, ridge_lambda=self.ridge, debug=self.debug)
-        self.loss = zinb.loss
+        output = ColwiseMultLayer([mean_with_disp, self.sf_layer]) # mu
+
+        packed = keras.layers.Lambda(
+            lambda l: ops.concatenate([l[0], l[1], l[2]], axis=-1),
+            name="pack"
+        )([output, theta_bcast, pi])
+        
+        self.ridge_lambda_for_loss = self.ridge 
+        self.loss = None
+
         self.extra_models["pi"] = Model(inputs=self.input_layer, outputs=pi)
         def _disp():
             import numpy as np
@@ -664,8 +722,7 @@ class ZINBConstantDispAutoencoder(Autoencoder):
             inputs=self.input_layer, outputs=self.decoder_output
         )
 
-        self.model = Model(inputs=[self.input_layer, self.sf_layer], outputs=output)
-
+        self.model = Model(inputs=[self.input_layer, self.sf_layer], outputs=packed)
         self.encoder = self.get_encoder()
 
     def predict(self, adata, mode="denoise", return_info=False, copy=False):
@@ -675,7 +732,7 @@ class ZINBConstantDispAutoencoder(Autoencoder):
 
         if return_info:
             adata.var["X_dca_dispersion"] = self.extra_models["dispersion"]()
-            adata.obsm["X_dca_dropout"] = self.extra_models["pi"].predict(adata.X)
+            adata.obsm["X_dca_dropout"] = self.extra_models["pi"].predict(adata.X, batch_size=256, verbose=0)
 
         super().predict(adata, mode, return_info, copy=False)
         return adata if copy else None
@@ -854,15 +911,20 @@ class ZINBForkAutoencoder(ZINBAutoencoder):
         )(self.last_hidden_mean)
 
         output = ColwiseMultLayer([mean, self.sf_layer])
-        output = SliceLayer(0, name="slice")([output, disp, pi])
+        
+        packed = keras.layers.Lambda(
+            lambda l: ops.concatenate([l[0], l[1], l[2]], axis=-1),
+            name="pack"
+        )([output, disp, pi])
+        
+        self.ridge_lambda_for_loss = self.ridge 
+        self.loss = None
 
-        zinb = ZINB(pi, theta=disp, ridge_lambda=self.ridge, debug=self.debug)
-        self.loss = zinb.loss
         self.extra_models["pi"] = Model(inputs=self.input_layer, outputs=pi)
         self.extra_models["dispersion"] = Model(inputs=self.input_layer, outputs=disp)
         self.extra_models["mean_norm"] = Model(inputs=self.input_layer, outputs=mean)
 
-        self.model = Model(inputs=[self.input_layer, self.sf_layer], outputs=output)
+        self.model = Model(inputs=[self.input_layer, self.sf_layer], outputs=packed)
 
         self.encoder = self.get_encoder()
 

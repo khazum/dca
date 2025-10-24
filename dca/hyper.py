@@ -7,9 +7,9 @@ from typing import Tuple
 import numpy as np
 import scipy.sparse as sp
 
-import tensorflow as tf
-from tensorflow.keras import optimizers as opt
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from keras import optimizers as opt
+from keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from keras.utils import set_random_seed
 try:
     import keras_tuner as kt  # package name: keras-tuner
 except Exception as e:
@@ -106,7 +106,7 @@ class DCAHyperModel(kt.HyperModel):
         else:
             loss_fn = WrappedLoss(net.loss)
 
-        net.model.compile(optimizer=optimizer, loss=loss_fn, run_eagerly=True, jit_compile=False)
+        net.model.compile(optimizer=optimizer, loss=loss_fn, run_eagerly=False, jit_compile=False)
         return net.model
 
 
@@ -172,15 +172,15 @@ def hyper(args):
     """
     # Reproducibility
     np.random.seed(42)
-    tf.random.set_seed(42)
+    set_random_seed(42)
     os.environ["PYTHONHASHSEED"] = "0"
 
-    if args.threads:
-        try:
-            tf.config.threading.set_intra_op_parallelism_threads(int(args.threads))
-            tf.config.threading.set_inter_op_parallelism_threads(int(args.threads))
-        except Exception:
-            pass
+    # if args.threads:
+    #     try:
+    #         tf.config.threading.set_intra_op_parallelism_threads(int(args.threads))
+    #         tf.config.threading.set_inter_op_parallelism_threads(int(args.threads))
+    #     except Exception:
+    #         pass
 
     # Load dataset once; tuning will handle per-trial normalization
     adata = io.read_dataset(

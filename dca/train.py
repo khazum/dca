@@ -28,11 +28,12 @@ from .network import AE_types
 import numpy as np
 import scipy.sparse as sp
 
-import tensorflow as tf
-from tensorflow.keras import optimizers as opt
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, TensorBoard, ModelCheckpoint
-from tensorflow.keras.losses import Loss
-from tensorflow.keras import ops
+import keras
+from keras import optimizers as opt
+from keras.callbacks import EarlyStopping, ReduceLROnPlateau, TensorBoard, ModelCheckpoint
+from keras.losses import Loss
+from keras import ops
+from .layers import lgamma
 
 class WrappedLoss(Loss):
     def __init__(self, base_loss):
@@ -43,37 +44,84 @@ class WrappedLoss(Loss):
     def call(self, y_true, y_pred):
         """Return batch-mean of per-sample, per-gene losses.
         Matches TF1 impl which averaged over *all* elements (B*G)."""
+        
+        # Ensure y_true and y_pred are tensors
+        y_true = ops.convert_to_tensor(y_true)
+        y_pred = ops.convert_to_tensor(y_pred)
+        
         try:
+            # Assumes base_loss is also backend-agnostic or 
+            # will return tensors compatible with the current backend.
             per_gene = self.base_loss(y_true, y_pred, mean=False)  # (B, G)
         except TypeError:
             # Fallback for built-in Keras losses without 'mean' arg (e.g., MSE)
-            per_gene = tf.math.squared_difference(y_true, y_pred)  # (B, G)
-        g = tf.cast(tf.shape(per_gene)[-1], per_gene.dtype)
-        per_sample = tf.reduce_sum(per_gene, axis=-1) / tf.maximum(g, 1.0)  # (B,)
-        return tf.reduce_mean(per_sample)  # scalar
+            # Replaced tf.math.squared_difference with ops.square
+            per_gene = ops.square(y_true - y_pred)  # (B, G)
+        
+        g = ops.cast(ops.shape(per_gene)[-1], per_gene.dtype)
+        per_sample = ops.sum(per_gene, axis=-1) / ops.maximum(g, ops.cast(1.0, per_gene.dtype))
+        return ops.mean(per_sample)  # scalar
 
 class PackedNBLoss(Loss):
     def __init__(self, eps=1e-10):
         super().__init__(reduction="sum", name="packed_nb_nll")
         self.eps = eps
+        self.lgamma = lgamma
 
     def call(self, y_true, y_pred):
         # Ensure last dimension is even so we can split into [mu|theta]
-        last = ops.shape(y_pred)[-1]
         if (y_pred.shape[-1] is not None) and (y_pred.shape[-1] % 2 != 0):
             raise ValueError(f"PackedNBLoss expects even last-dim, got {y_pred.shape[-1]}")
         mu, theta = ops.split(y_pred, 2, axis=-1)
+        eps = ops.cast(self.eps, mu.dtype)
+        t1 = self.lgamma(theta + eps) + self.lgamma(y_true + 1.0) - self.lgamma(y_true + theta + eps)
+        t2 = (theta + y_true) * ops.log1p(mu / (theta + eps)) + y_true * (ops.log(theta + eps) - ops.log(mu + eps))
+        per_gene = t1 + t2
+        g = ops.cast(ops.shape(per_gene)[-1], per_gene.dtype)
+        per_sample = ops.sum(per_gene, axis=-1) / ops.maximum(g, ops.cast(1.0, per_gene.dtype))
+        return ops.mean(per_sample)
+class PackedZINBLoss(Loss):
+    def __init__(self, ridge_lambda=0.0, eps=1e-10):
+        super().__init__(reduction="sum", name="packed_zinb_nll")
+        self.ridge_lambda = ridge_lambda
+        self.eps = eps
+        self.lgamma = lgamma  # Use the imported lgamma layer
 
-        eps = tf.cast(self.eps, mu.dtype)
-
-        # Negative log-likelihood of NB (pure TF ops)
-        t1 = tf.math.lgamma(theta + eps) + tf.math.lgamma(y_true + 1.0) - tf.math.lgamma(y_true + theta + eps)
-        t2 = (theta + y_true) * tf.math.log1p(mu / (theta + eps)) + y_true * (tf.math.log(theta + eps) - tf.math.log(mu + eps))
-        per_gene = t1 + t2                                    # (B, G)
-        g = tf.cast(tf.shape(per_gene)[-1], per_gene.dtype)
-        per_sample = tf.reduce_sum(per_gene, axis=-1) / tf.maximum(g, 1.0)  # (B,)
-        return tf.reduce_mean(per_sample)                     # scalar
-    
+    def call(self, y_true, y_pred):
+        # y_pred is [mu, theta, pi]
+        if (y_pred.shape[-1] is None) or (y_pred.shape[-1] % 3 != 0):
+            raise ValueError(f"PackedZINBLoss expects last-dim to be 3*genes, got {y_pred.shape[-1]}")
+        
+        mu, theta, pi = ops.split(y_pred, 3, axis=-1)
+        eps = ops.cast(self.eps, mu.dtype)
+        
+        # --- NB part ---
+        theta = ops.minimum(theta, ops.cast(1e6, theta.dtype))
+        
+        t1 = self.lgamma(theta + eps) + self.lgamma(y_true + 1.0) - self.lgamma(y_true + theta + eps)
+        t2 = (theta + y_true) * ops.log(1.0 + (mu / (theta + eps))) + (y_true * (ops.log(theta + eps) - ops.log(mu + eps)))
+        nb_case = t1 + t2
+        
+        # Add ZINB part
+        nb_case = nb_case - ops.log(1.0 - pi + eps)
+        
+        # --- ZINB part ---
+        zero_nb = ops.power(theta / (theta + mu + eps), theta)
+        zero_case = -ops.log(pi + ((1.0 - pi) * zero_nb) + eps)
+        
+        result = ops.where(ops.less(y_true, ops.cast(1e-8, y_true.dtype)), zero_case, nb_case)
+        
+        if self.ridge_lambda > 0:
+            ridge = self.ridge_lambda * ops.square(pi)
+            result += ridge
+            
+        result = ops.nan_to_num(result, nan=np.inf, posinf=None, neginf=None)
+        
+        # --- Aggregation ---
+        g = ops.cast(ops.shape(result)[-1], result.dtype)
+        per_sample = ops.sum(result, axis=-1) / ops.maximum(g, ops.cast(1.0, result.dtype))
+        return ops.mean(per_sample)
+     
 def train(
     adata,
     network,
@@ -94,12 +142,12 @@ def train(
     threads=None,
     **kwds
 ):
-    if threads:
-        try:
-            tf.config.threading.set_intra_op_parallelism_threads(int(threads))
-            tf.config.threading.set_inter_op_parallelism_threads(int(threads))
-        except Exception:
-            pass
+    # if threads:
+    #     try:
+    #         tf.config.threading.set_intra_op_parallelism_threads(int(threads))
+    #         tf.config.threading.set_inter_op_parallelism_threads(int(threads))
+    #     except Exception:
+    #         pass
         
     model = network.model
     if output_dir is not None:
@@ -113,13 +161,31 @@ def train(
         else opt_cls(learning_rate=learning_rate, clipvalue=clip_grad)
     )
 
-    if any(l.name == "pack" for l in model.layers):
-        loss_fn = PackedNBLoss()
-    else:
+    is_packed = any(l.name == "pack" for l in model.layers)
+    if not is_packed:
+        # Fallback to old method if 'pack' layer isn't found
         loss_fn = WrappedLoss(network.loss)
+    else:
+        # 'pack' layer exists, check output shape to decide loss
+        # NB models pack [mu, theta] -> 2 * G
+        # ZINB models pack [mu, theta, pi] -> 3 * G
+        output_dim = model.output_shape[-1]
+        # Use network.output_size, as input_size might differ
+        genes_dim = network.output_size 
+        
+        if output_dim == 2 * genes_dim:
+            loss_fn = PackedNBLoss()
+        elif output_dim == 3 * genes_dim:
+            # Get ridge_lambda from the network object
+            ridge = getattr(network, "ridge_lambda_for_loss", 0.0)
+            loss_fn = PackedZINBLoss(ridge_lambda=ridge)
+        else:
+            # Fallback for models I didn't modify or non-std packing
+            print(f"Warning: Packed layer found but output dim {output_dim} doesn't match 2*G or 3*G (G={genes_dim}). Falling back to WrappedLoss.")
+            loss_fn = WrappedLoss(network.loss)
 
-    model.compile(optimizer=optimizer, loss=loss_fn, run_eagerly=True, jit_compile=False)
-
+    model.compile(optimizer=optimizer, loss=loss_fn, run_eagerly=False, jit_compile=False)
+    
     # Callbacks
     callbacks = []
 
@@ -147,7 +213,7 @@ def train(
     if verbose:
         model.summary()
 
-    sf = np.asarray(adata.obs.size_factors).reshape(-1, 1)  # (n, 1)
+    sf = np.asarray(adata.obs.size_factors).reshape(-1, 1).astype(np.float32)
     y = adata.raw.X if use_raw_as_output else adata.X
     if sp.issparse(y):
         y = y.A  # dense
@@ -182,15 +248,15 @@ def train_with_args(args):
     # set seed for reproducibility
     random.seed(42)
     np.random.seed(42)
-    tf.random.set_seed(42)
+    keras.utils.set_random_seed(42)
     os.environ["PYTHONHASHSEED"] = "0"
 
-    if args.threads:
-        try:
-            tf.config.threading.set_intra_op_parallelism_threads(int(args.threads))
-            tf.config.threading.set_inter_op_parallelism_threads(int(args.threads))
-        except Exception:
-            pass
+    # if args.threads:
+    #     try:
+    #         tf.config.threading.set_intra_op_parallelism_threads(int(args.threads))
+    #         tf.config.threading.set_inter_op_parallelism_threads(int(args.threads))
+    #     except Exception:
+    #         pass
 
     adata = io.read_dataset(
         args.input,

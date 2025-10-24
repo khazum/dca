@@ -5,13 +5,9 @@ import numpy as np
 import scanpy as sc
 
 try:
-    import tensorflow as tf
+    import keras
 except ImportError:
-    raise ImportError('DCA requires TensorFlow v2+. Please follow instructions'
-                      ' at https://www.tensorflow.org/install/ to install'
-                      ' it.')
-
-
+    raise ImportError('DCA requires keras 3+.')
 from .io import read_dataset, normalize
 from .train import train
 from .network import AE_types
@@ -150,7 +146,8 @@ def dca(adata,
     # set seed for reproducibility
     random.seed(random_state)
     np.random.seed(random_state)
-    tf.random.set_seed(random_state)
+    keras.utils.set_random_seed(42)
+
     os.environ['PYTHONHASHSEED'] = '0'
 
     # this creates adata.raw with raw counts and copies adata if copy==True

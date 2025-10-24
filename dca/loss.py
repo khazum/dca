@@ -1,7 +1,6 @@
 import numpy as np
-from tensorflow.keras import ops
-import tensorflow as tf  # kept only for optional debug/summary/name_scope
-from tensorflow.math import lgamma
+from keras import ops
+from .layers import lgamma
 
 def _nelem(x):
     is_not_nan = ops.logical_not(ops.isnan(x))
@@ -57,6 +56,7 @@ class NB(object):
         self.scope = scope
         self.masking = masking
         self.theta = theta
+        self.lgamma = lgamma
 
     def loss(self, y_true, y_pred, mean=True):
         scale_factor = self.scale_factor
@@ -74,7 +74,7 @@ class NB(object):
         # Use Keras ops to keep compatibility with KerasTensors.
         theta = ops.minimum(self.theta, ops.cast(1e6, self.theta.dtype))
 
-        t1 = lgamma(theta + eps) + lgamma(y_true + 1.0) - lgamma(y_true + theta + eps)
+        t1 = self.lgamma(theta + eps) + self.lgamma(y_true + 1.0) - self.lgamma(y_true + theta + eps)
         t2 = (theta + y_true) * ops.log(1.0 + (y_pred / (theta + eps))) + (y_true * (ops.log(theta + eps) - ops.log(y_pred + eps)))
 
 
@@ -120,10 +120,10 @@ class ZINB(NB):
 
         result = ops.nan_to_num(result, nan=np.inf, posinf=None, neginf=None)
 
-        if self.debug:
-            tf.summary.histogram('nb_case', nb_case)
-            tf.summary.histogram('zero_nb', zero_nb)
-            tf.summary.histogram('zero_case', zero_case)
-            tf.summary.histogram('ridge', ridge)
+        # if self.debug:
+        #     tf.summary.histogram('nb_case', nb_case)
+        #     tf.summary.histogram('zero_nb', zero_nb)
+        #     tf.summary.histogram('zero_case', zero_case)
+        #     tf.summary.histogram('ridge', ridge)
 
         return result
