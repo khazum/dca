@@ -32,7 +32,7 @@ import tensorflow as tf
 from tensorflow.keras import optimizers as opt
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, TensorBoard, ModelCheckpoint
 from tensorflow.keras.losses import Loss
-from tensorflow.keras import ops as K
+from tensorflow.keras import ops
 
 class WrappedLoss(Loss):
     def __init__(self, base_loss):
@@ -44,8 +44,8 @@ class WrappedLoss(Loss):
         try:
             # Get per-gene loss and reduce to a scalar ourselves
             per_gene = self.base_loss(y_true, y_pred, mean=False)  # (B, G)
-            per_sample = K.sum(per_gene, axis=-1)                  # (B,)
-            return K.mean(per_sample)                              # scalar
+            per_sample = ops.sum(per_gene, axis=-1)                  # (B,)
+            return ops.mean(per_sample)                              # scalar
         except TypeError:
             # Base loss already returns a scalar: just use it as-is
             return self.base_loss(y_true, y_pred)
@@ -60,7 +60,7 @@ class PackedNBLoss(Loss):
         last = ops.shape(y_pred)[-1]
         if (y_pred.shape[-1] is not None) and (y_pred.shape[-1] % 2 != 0):
             raise ValueError(f"PackedNBLoss expects even last-dim, got {y_pred.shape[-1]}")
-        mu, theta = ops.split(y_pred, num_or_size_splits=2, axis=-1)
+        mu, theta = ops.split(y_pred, 2, axis=-1)
 
         eps = tf.cast(self.eps, mu.dtype)
 
