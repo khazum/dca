@@ -1,0 +1,42 @@
+[build-system]
+# Use setuptools as the build backend, as suggested by the warning
+requires = ["setuptools>=64.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "DCA"
+version = "0.3.4"
+description = "Count autoencoder for scRNA-seq denoising - modernized implementation (Tensorflow==2.20.0) of the package DCA(https://github.com/theislab/dca)"
+authors = [
+    { name = "Marcin Malec", email = "khazum@gmail.com" },
+]
+license = { text = "Apache License 2.0" }
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3.9",
+]
+
+# This section replaces 'install_requires'
+dependencies = [
+    "tensorflow[and-cuda]>=2.20.0",
+    "numpy",
+    "h5py",
+    "six",
+    "scikit-learn",
+    "scanpy",
+    "keras-tuner",
+    "pandas",
+]
+
+[project.urls]
+Homepage = "https://github.com/KHAZUM/dca"
+Repository = "https://github.com/KHAZUM/dca"
+
+# This section replaces 'entry_points'
+[project.scripts]
+dca = "dca.__main__:main"
+
+[tool.setuptools]
+# This tells setuptools to find your 'dca' package
+packages = ["dca"]

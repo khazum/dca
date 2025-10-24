@@ -226,11 +226,19 @@ class Autoencoder:
             print("dca: Calculating reconstructions...")
 
             sf = adata.obs.size_factors.values.reshape(-1, 1)
-            adata.X = self.model.predict({"count": adata.X, "size_factors": sf})
-
-            # adata.uns['dca_loss'] = self.model.test_on_batch({'count': adata.X,
-            #                                                  'size_factors': adata.obs.size_factors},
-            #                                                 adata.raw.X)
+            pred = self.model.predict({"count": adata.X, "size_factors": sf})
+            # Some models (e.g., NB with conditional dispersion) pack [mu|theta] to y_pred.
+            # If a layer named "pack" is present, split the features and keep mu only.
+            if any(l.name == "pack" for l in self.model.layers):
+                g = self.output_size
+                # Defensive check: last dim must be 2*g
+                if pred.shape[-1] != 2 * g:
+                    raise ValueError(
+                        f"Packed output width {pred.shape[-1]} != 2*output_size ({2*g})."
+                    )
+                adata.X = pred[:, :g]
+            else:
+                adata.X = pred
         if mode == "latent":
             adata.X = adata.raw.X.copy()  # recover normalized expression values
 
@@ -398,9 +406,9 @@ class NBAutoencoder(Autoencoder):
 
         super().write(adata, file_path, mode, colnames=colnames)
 
-        if "X_dca_dispersion" in adata.obsm_keys():
+        if "X_dca_dispersion" in adata.var_keys():
             write_text_matrix(
-                adata.obsm["X_dca_dispersion"],
+                adata.var["X_dca_dispersion"].reshape(1, -1),
                 os.path.join(file_path, "dispersion.tsv"),
                 colnames=colnames,
                 transpose=True,

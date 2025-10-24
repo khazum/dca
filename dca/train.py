@@ -56,7 +56,12 @@ class PackedNBLoss(Loss):
         self.eps = eps
 
     def call(self, y_true, y_pred):
-        mu, theta = tf.split(y_pred, num_or_size_splits=2, axis=-1)
+        # Ensure last dimension is even so we can split into [mu|theta]
+        last = ops.shape(y_pred)[-1]
+        if (y_pred.shape[-1] is not None) and (y_pred.shape[-1] % 2 != 0):
+            raise ValueError(f"PackedNBLoss expects even last-dim, got {y_pred.shape[-1]}")
+        mu, theta = ops.split(y_pred, num_or_size_splits=2, axis=-1)
+
         eps = tf.cast(self.eps, mu.dtype)
 
         # Negative log-likelihood of NB (pure TF ops)
@@ -110,7 +115,7 @@ def train(
     else:
         loss_fn = WrappedLoss(network.loss)
 
-    model.compile(optimizer=optimizer, loss=loss_fn, run_eagerly=True, jit_compile=False)
+    model.compile(optimizer=optimizer, loss=loss_fn, run_eagerly=False, jit_compile=False)
 
     # Callbacks
     callbacks = []

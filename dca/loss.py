@@ -38,7 +38,7 @@ def poisson_loss(y_true, y_pred):
     # however keeping it gives a nice lower bound to zero
     ret = y_pred - y_true * ops.log(y_pred + 1e-10) + lgamma(y_true + 1.0)
 
-    return ops.divide(ops.sum(ret), nelem)
+    return ops.divide_no_nan(ops.sum(ret), nelem)
 
 
 # We need a class (or closure) here,
