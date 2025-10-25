@@ -4,28 +4,38 @@ from keras import ops
 
 class ConstantDispersionLayer(Layer):
     """
-    Identity layer that carries a trainable dispersion parameter.
+    Layer that learns a constant dispersion parameter theta (1xG)
+    and broadcasts it to the input shape (BxG).
+    It takes an input tensor only to infer the batch size for broadcasting.
     """
     def build(self, input_shape):
-        self.theta = self.add_weight(
-            shape=(1, input_shape[1]),
+        self.G = input_shape[-1]
+        if self.G is None:
+             raise ValueError("The last dimension of the input shape must be defined.")
+
+        # We store the raw (log) value for unconstrained optimization
+        self.theta_raw = self.add_weight(
+            shape=(1, self.G),
             initializer="zeros",
             trainable=True,
-            name="theta",
+            # Name changed to reflect it's the raw trainable parameter
+            name="theta_raw",
         )
         super().build(input_shape)
 
     def call(self, x):
-        # Identity pass-through; dispersion is exposed via trainable weights.
-        return x
+        # x (B, G) is used only for shape inference.
+        
+        # Calculate the dispersion value (theta), clipped for stability.
+        # This MUST happen inside call() for gradient tracking.
+        theta = ops.clip(ops.exp(self.theta_raw), 1e-3, 1e4) # (1, G)
+        
+        # Broadcast to (B, G) using the dynamic shape of x.
+        # This ensures the operation is within the graph and handles dynamic batch sizes.
+        return theta * ops.ones_like(x)
     
     def compute_output_shape(self, input_shape):
         return input_shape
-
-    @property
-    def theta_exp(self):
-        # Compute on-the-fly so it always reflects current weights.
-        return ops.clip(ops.exp(self.theta), 1e-3, 1e4)
 
 class SliceLayer(Layer):
     def __init__(self, index, **kwargs):
@@ -109,4 +119,4 @@ def lgamma(x):
             + (z + 0.5) * ops.log(t)
             - t)
 
-ColwiseMultLayer = Lambda(lambda l: ops.multiply(l[0], ops.reshape(l[1], (-1, 1))))
+# ColwiseMultLayer = Lambda(lambda l: ops.multiply(l[0], ops.reshape(l[1], (-1, 1))))

@@ -134,12 +134,18 @@ class DCATuner(kt.BayesianOptimization):
         )
 
         # Keras expects dense arrays
-        X = ad.X.A if sp.issparse(ad.X) else np.asarray(ad.X)
-        X = np.asarray(X, dtype=np.float32)
-        sf = np.asarray(ad.obs.size_factors).reshape(-1, 1).astype(np.float32)
+        # Standardize X: Use toarray() instead of .A, enforce float32 and C-contiguous
+        X_dense = ad.X.toarray() if sp.issparse(ad.X) else np.asarray(ad.X)
+        X = np.ascontiguousarray(X_dense, dtype=np.float32)
+
+        # Standardize sf
+        sf = np.asarray(ad.obs.size_factors).reshape(-1, 1)
+        sf = np.ascontiguousarray(sf, dtype=np.float32)
+
+        # Standardize y (output)
         y = ad.raw.X
-        y = y.A if sp.issparse(y) else np.asarray(y)
-        y = np.asarray(y, dtype=np.float32)
+        y_dense = y.toarray() if sp.issparse(y) else np.asarray(y)
+        y = np.ascontiguousarray(y_dense, dtype=np.float32)
 
         # Feed tensors
         x_train = {"count": X, "size_factors": sf}

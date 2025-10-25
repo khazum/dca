@@ -185,6 +185,16 @@ def train(
             loss_fn = WrappedLoss(network.loss)
 
     model.compile(optimizer=optimizer, loss=loss_fn, run_eagerly=False, jit_compile=False)
+
+    # FIX Retracing: Compile auxiliary models (encoder and extra models) explicitly.
+    # This prevents lazy tracing when predict() is called later.
+    if network.encoder:
+        network.encoder.compile(run_eagerly=False, jit_compile=False)
+
+    for m in network.extra_models.values():
+        # Some extra_models might be functions (e.g., _disp), not Keras models.
+        if isinstance(m, keras.Model):
+            m.compile(run_eagerly=False, jit_compile=False)
     
     # Callbacks
     callbacks = []
@@ -213,21 +223,33 @@ def train(
     if verbose:
         model.summary()
 
-    sf = np.asarray(adata.obs.size_factors).reshape(-1, 1).astype(np.float32)
+    # Prepare data
+    # FIX Retracing: Enforce float32 for size factors
+    # FIX Retracing: Enforce float32 and C-contiguous layout for size factors
+    sf = np.asarray(adata.obs.size_factors).reshape(-1, 1)
+    sf = np.ascontiguousarray(sf, dtype=np.float32)    
+
     y = adata.raw.X if use_raw_as_output else adata.X
     if sp.issparse(y):
-        y = y.A  # dense
-        
-    # Keras expects dense arrays
-    X = adata.X.A if sp.issparse(adata.X) else np.asarray(adata.X)
+        y_dense = y.toarray()
+    else:
+        y_dense = np.asarray(y)
+
+    # Standardize X: Use toarray() instead of .A
+    X_dense = adata.X.toarray() if sp.issparse(adata.X) else np.asarray(adata.X)
+    
+    # FIX Retracing: Enforce float32 and C-contiguous layout for input features
+    X = np.ascontiguousarray(X_dense, dtype=np.float32)
+    
     inputs = {"count": X, "size_factors": sf}
-    output = y  # already dense
+    output = y_dense
+    
     if output_subset:
         gene_idx = [np.where(adata.raw.var_names == x)[0][0] for x in output_subset]
-        # slice the dense array instead of reloading a sparse matrix
         output = output[:, gene_idx]
-    # ensure dtype
-    output = np.asarray(output, dtype=np.float32)
+        
+    # FIX Retracing: Ensure output dtype is float32
+    output = np.ascontiguousarray(output, dtype=np.float32)
 
     history = model.fit(
         inputs,
