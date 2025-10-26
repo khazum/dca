@@ -22,8 +22,8 @@ def mse_loss(y_true, y_pred):
 
 class WrappedLoss(Loss):
     def __init__(self, base_loss):
-        # Use "none" reduction to return per-sample losses; Keras handles the final batch averaging.
-        super().__init__(reduction="none", name="wrapped_dca_loss")
+        # Use default reduction ("sum_over_batch_size"). Keras handles the final batch averaging.
+        super().__init__(name="wrapped_dca_loss")
         self.base_loss = base_loss
 
     def call(self, y_true, y_pred):
@@ -47,8 +47,8 @@ class WrappedLoss(Loss):
         return per_sample
 class PackedNBLoss(Loss):
     def __init__(self, eps=1e-10):
-        # Use "none" reduction
-        super().__init__(reduction="none", name="packed_nb_nll")
+        # Use default reduction
+        super().__init__(name="packed_nb_nll")
         self.eps = eps
         self.lgamma = lgamma
 
@@ -74,8 +74,8 @@ class PackedNBLoss(Loss):
 
 class PackedZINBLoss(Loss):
     def __init__(self, ridge_lambda=0.0, eps=1e-10):
-        # Use "none" reduction
-        super().__init__(reduction="none", name="packed_zinb_nll")
+        # Use default reduction
+        super().__init__(name="packed_zinb_nll")
         self.ridge_lambda = ridge_lambda
         self.eps = eps
         self.lgamma = lgamma
