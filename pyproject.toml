@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "DCA"
 version = "0.3.4"
-description = "Count autoencoder for scRNA-seq denoising - modernized implementation (Tensorflow==2.20.0) of the package DCA(https://github.com/theislab/dca)"
+description = "Count autoencoder for scRNA-seq denoising - modernized implementation (Keras 3+, Tensorflow>=2.16) of the package DCA(https://github.com/theislab/dca)"
 authors = [
     { name = "Marcin Malec", email = "khazum@gmail.com" },
 ]
@@ -24,8 +24,8 @@ requires-python = ">=3.9"
 
 # This section replaces 'install_requires'
 dependencies = [
-    "tensorflow[and-cuda]>=2.20.0",
-    "keras>=3.0",
+    "tensorflow>=2.16.0",
+    "keras>=3.0,
     "numpy",
     "h5py",
     "six",

@@ -19,14 +19,14 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 import pickle
 import numpy as np
 import keras
-from keras.layers import Input, Dense, Dropout, Activation, BatchNormalization, Lambda, Multiply, Concatenate
+from keras.layers import Input, Dense, Dropout, Lambda, Activation, BatchNormalization, Multiply, Concatenate
 from keras.models import Model
 from keras.regularizers import l1_l2
 from keras.losses import MeanSquaredError
 from keras import ops
 import scipy.sparse as sp
 
-from .loss import poisson_loss, NB, ZINB
+from .loss import poisson_loss
 from .layers import (
     ConstantDispersionLayer,
     ElementwiseDense,

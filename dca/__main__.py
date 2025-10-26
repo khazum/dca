@@ -14,6 +14,7 @@
 # ==============================================================================
 
 import argparse
+from typing import Sequence
 
 def parse_args(args: Sequence[str] | None = None) -> argparse.Namespace:
         parser = argparse.ArgumentParser(description='Autoencoder')
@@ -144,7 +145,7 @@ def main() -> None:
         try:
                 import tensorflow as tf
         except ImportError:
-                raise ImportError('DCA requires TensorFlow v2.20.0+. Please follow instructions'
+                raise ImportError('DCA requires TensorFlow v2.16.0+. Please follow instructions'
                                 ' at https://www.tensorflow.org/install/ to install'
                                 ' it.')
 

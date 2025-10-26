@@ -1,5 +1,5 @@
 # dca_patched/dca/layers.py
-from keras.layers import Layer, Lambda, Dense, InputSpec
+from keras.layers import Layer, Dense, InputSpec
 from keras import ops
 
 class ConstantDispersionLayer(Layer):
@@ -71,6 +71,7 @@ class ElementwiseDense(Dense):
             out = self.activation(out)
         return out
 
+# Coefficients for the Lanczos approximation (g=7)
 _LANCZOS = [
     0.99999999999980993,
     676.5203681218851,
@@ -85,6 +86,10 @@ _LANCZOS = [
 _LOG_SQRT_2PI = 0.9189385332046727  # 0.5*log(2π)
 
 def lgamma(x):
+    """
+    Backend-agnostic log-gamma implementation using Lanczos approximation (g=7).
+    Numerically stable and differentiable.
+    """
     # backend-agnostic (works on KerasTensors); no tf.* calls
     x = ops.cast(x, "float32")
     x = ops.maximum(x, ops.cast(1e-7, x.dtype))  # avoid poles
