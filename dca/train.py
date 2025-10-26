@@ -33,6 +33,7 @@ from keras import optimizers as opt
 from keras.callbacks import EarlyStopping, ReduceLROnPlateau, TensorBoard, ModelCheckpoint
 from keras.losses import Loss
 from keras import ops
+import gc
 from .layers import lgamma
 
 class WrappedLoss(Loss):
@@ -111,9 +112,8 @@ class PackedZINBLoss(Loss):
         
         result = ops.where(ops.less(y_true, ops.cast(1e-8, y_true.dtype)), zero_case, nb_case)
         
-        if self.ridge_lambda > 0:
-            ridge = self.ridge_lambda * ops.square(pi)
-            result += ridge
+        ridge = ops.cast(self.ridge_lambda, result.dtype) * ops.square(pi)
+        result += ridge
             
         result = ops.nan_to_num(result, nan=np.inf, posinf=None, neginf=None)
         
@@ -224,10 +224,12 @@ def train(
         model.summary()
 
     # Prepare data
-    # FIX Retracing: Enforce float32 for size factors
-    # FIX Retracing: Enforce float32 and C-contiguous layout for size factors
-    sf = np.asarray(adata.obs.size_factors).reshape(-1, 1)
-    sf = np.ascontiguousarray(sf, dtype=np.float32)    
+    # Prepare data using the centralized method in the network object
+    # This ensures consistency between training and prediction inputs.
+    X, sf = network._prepare_inputs(adata)
+
+    # FIX Retracing: Use a list/tuple matching the Model definition order: [count, size_factors]
+    inputs = [X, sf]   
 
     y = adata.raw.X if use_raw_as_output else adata.X
     if sp.issparse(y):
@@ -235,13 +237,6 @@ def train(
     else:
         y_dense = np.asarray(y)
 
-    # Standardize X: Use toarray() instead of .A
-    X_dense = adata.X.toarray() if sp.issparse(adata.X) else np.asarray(adata.X)
-    
-    # FIX Retracing: Enforce float32 and C-contiguous layout for input features
-    X = np.ascontiguousarray(X_dense, dtype=np.float32)
-    
-    inputs = {"count": X, "size_factors": sf}
     output = y_dense
     
     if output_subset:
@@ -272,6 +267,12 @@ def train_with_args(args):
     np.random.seed(42)
     keras.utils.set_random_seed(42)
     os.environ["PYTHONHASHSEED"] = "0"
+
+    # Fix: Clear Keras session to release resources from previous models and reset
+    # the tracing history. This mitigates retracing warnings when iterating
+    # over datasets with different shapes.
+    gc.collect()
+    keras.backend.clear_session()
 
     # if args.threads:
     #     try:
@@ -333,8 +334,14 @@ def train_with_args(args):
     net.save()
     net.build()
 
+    # Ensure the training data is a concrete copy, not a view.
+    # Views can sometimes lead to subtle issues with memory layout.
+    train_adata = adata[adata.obs.dca_split == "train"]
+    if hasattr(train_adata, 'is_view') and train_adata.is_view:
+        train_adata = train_adata.copy()
+
     losses = train(
-        adata[adata.obs.dca_split == "train"],
+        train_adata,
         net,
         output_dir=args.outputdir,
         learning_rate=args.learningrate,

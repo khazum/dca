@@ -3,6 +3,7 @@ import random
 import anndata
 import numpy as np
 import scanpy as sc
+import gc
 
 try:
     import keras
@@ -140,6 +141,9 @@ def dca(adata,
     are true, a tuple of anndata and model is returned in that order.
     """
 
+    gc.collect()
+    keras.backend.clear_session()
+
     assert isinstance(adata, anndata.AnnData), 'adata must be an AnnData instance'
     assert mode in ('denoise', 'latent'), '%s is not a valid mode.' % mode
 
@@ -193,8 +197,15 @@ def dca(adata,
         'learning_rate': learning_rate
     }
 
-    hist = train(adata[adata.obs.dca_split == 'train'], net, **training_kwds)
-    res = net.predict(adata, mode, return_info, copy)
+    # Ensure the training data is a concrete copy, not a view.
+    # Views can sometimes lead to subtle issues with memory layout when converting
+    # to NumPy/TensorFlow, potentially contributing to retracing.
+    train_adata = adata[adata.obs.dca_split == 'train']
+    if hasattr(train_adata, 'is_view') and train_adata.is_view:
+        train_adata = train_adata.copy()
+
+    hist = train(train_adata, net, **training_kwds)
+    res = net.predict(adata, mode, return_info, copy, batch_size=batch_size)
     adata = res if copy else adata
 
     if return_info:

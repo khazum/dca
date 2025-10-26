@@ -148,7 +148,8 @@ class DCATuner(kt.BayesianOptimization):
         y = np.ascontiguousarray(y_dense, dtype=np.float32)
 
         # Feed tensors
-        x_train = {"count": X, "size_factors": sf}
+        # Use a list/tuple matching the Model definition order: [count, size_factors]
+        x_train = [X, sf]
         y_train = y
 
         # Pass prepared data to fit()

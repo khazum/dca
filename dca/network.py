@@ -214,34 +214,45 @@ class Autoencoder:
         )
         return ret
 
-    def predict(self, adata, mode="denoise", return_info=False, copy=False):
-
-        assert mode in ("denoise", "latent", "full"), "Unknown mode"
-
-        adata = adata.copy() if copy else adata
-
-        # FIX Retracing: Ensure inputs are consistently dense, float32, and C-contiguous.
+    def _prepare_inputs(self, adata):
+        # Centralized input preparation (Handles FIX Retracing logic)
+        # Ensure inputs are consistently dense, float32, and C-contiguous.
+        
+        # Prepare size factors (sf)
         # Use np.asarray for robust Pandas conversion, then ascontiguousarray.
         sf = np.asarray(adata.obs.size_factors).reshape(-1, 1)
         sf = np.ascontiguousarray(sf, dtype=np.float32)
         
-        # Standardize X: Use sp.issparse() and .toarray() instead of hasattr() and .A
+        # Prepare input features (X)
+        # Standardize X: Use sp.issparse() and .toarray()
         if sp.issparse(adata.X):
              X_dense = adata.X.toarray()
         else:
              X_dense = np.asarray(adata.X)
         X = np.ascontiguousarray(X_dense, dtype=np.float32)
+        
+        return X, sf
 
-        inputs = {"count": X, "size_factors": sf}
+    def predict(self, adata, mode="denoise", return_info=False, copy=False, batch_size=256):
+        assert mode in ("denoise", "latent", "full"), "Unknown mode"
+
+        adata = adata.copy() if copy else adata
+
+        # Optimization: Prepare inputs once
+        X, sf = self._prepare_inputs(adata)
+        inputs = [X, sf]
+
+        # Optimization: Allow subclasses to perform predictions using extra models if return_info=True
+        if return_info:
+            self._predict_info(adata, X, sf, batch_size)
 
         if mode in ("latent", "full"):
             print("dca: Calculating low dimensional representations...")
             # Optimization: The encoder only requires the count input (X)
-            adata.obsm["X_dca"] = self.encoder.predict(X, batch_size=256, verbose=0)
-                
+            adata.obsm["X_dca"] = self.encoder.predict(X, batch_size=batch_size, verbose=0)                
         if mode in ("denoise", "full"):
             print("dca: Calculating reconstructions...")
-            pred = self.model.predict(inputs, batch_size=256, verbose=0)
+            pred = self.model.predict(inputs, batch_size=batch_size, verbose=0)
             
             # Check if a layer named "pack" exists (the Concatenate layer now has this name)
             if any(l.name == "pack" for l in self.model.layers):
@@ -266,6 +277,10 @@ class Autoencoder:
             adata.X = adata.raw.X.copy()  # recover normalized expression values
 
         return adata if copy else None
+
+    def _predict_info(self, adata, X, sf, batch_size):
+        # Base implementation does nothing. Subclasses override this.
+        pass
 
     def write(self, adata, file_path, mode="denoise", colnames=None):
 
@@ -364,26 +379,18 @@ class NBConstantDispAutoencoder(Autoencoder):
         self.model = Model(inputs=[self.input_layer, self.sf_layer], outputs=packed)
         self.encoder = self.get_encoder()
 
-    def predict(self, adata, mode="denoise", return_info=False, copy=False):
-        # 1. Handle copy
-        adata_input = adata.copy() if copy else adata
+    # Optimization: Override _predict_info instead of predict
+    def _predict_info(self, adata, X, sf, batch_size):
+        # Constant dispersion doesn't depend on input X, retrieve from layer weights
+        # We assign the dispersion values (gene-wise constants) to adata.var
+        disp_values = self.extra_models["dispersion"]()
+        if disp_values is not None:
+            # Robustness: Ensure the shape matches the number of genes in the current adata view/copy
+            if len(disp_values) == adata.n_vars:
+                adata.var["X_dca_dispersion"] = disp_values
+            else:
+                print(f"dca: Warning: Mismatch between model dispersion parameters ({len(disp_values)}) and adata genes ({adata.n_vars}). Skipping dispersion output.")
 
-        # 2. Calculate info if requested (Constant dispersion doesn't depend on input X)
-        if return_info:
-            # We assign the dispersion values (gene-wise constants) to adata.var
-            disp_values = self.extra_models["dispersion"]()
-            if disp_values is not None:
-                # Robustness: Ensure the shape matches the number of genes in the current adata view/copy
-                if len(disp_values) == adata_input.n_vars:
-                    adata_input.var["X_dca_dispersion"] = disp_values
-                else:
-                    print(f"dca: Warning: Mismatch between model dispersion parameters ({len(disp_values)}) and adata genes ({adata_input.n_vars}). Skipping dispersion output.")
-
-        # 3. Call base implementation. We use copy=False because we already handled it.
-        super().predict(adata_input, mode, return_info, copy=False)
-        
-        # 4. Return the result if copy was requested
-        return adata_input if copy else None
     def write(self, adata, file_path, mode="denoise", colnames=None):
         colnames = adata.var_names.values if colnames is None else colnames
         rownames = adata.obs_names.values
@@ -421,31 +428,18 @@ class NBAutoencoder(Autoencoder):
 
 
         # keep for inspection; training will override self.loss
-        nb = NB(theta=disp, debug=self.debug)
-        self.loss = nb.loss
+        # Let train.py choose PackedNBLoss
+        self.loss = None
         self.extra_models["dispersion"] = Model(inputs=self.input_layer, outputs=disp)
         self.extra_models["mean_norm"] = Model(inputs=self.input_layer, outputs=mean)
         self.extra_models["decoded"] = Model(inputs=self.input_layer, outputs=self.decoder_output)
         self.model = Model(inputs=[self.input_layer, self.sf_layer], outputs=packed)
 
-        self.encoder = self.get_encoder()
-
-    def predict(self, adata, mode="denoise", return_info=False, copy=False):
-        # 1. Handle copy
-        adata_input = adata.copy() if copy else adata
-
-        # 2. Calculate info if requested (Conditional dispersion depends on input X)
-        if return_info:
-            X_dense = adata_input.X.toarray() if sp.issparse(adata_input.X) else np.asarray(adata_input.X)
-            X_input = np.ascontiguousarray(X_dense, dtype=np.float32)
-            # Predict dispersion using the standardized input features
-            adata_input.obsm["X_dca_dispersion"] = self.extra_models["dispersion"].predict(X_input, batch_size=256, verbose=0)
-
-        # 3. Call base implementation. copy=False because we handled it.
-        super().predict(adata_input, mode, return_info, copy=False)
-
-        # 4. Return result
-        return adata_input if copy else None
+    # Optimization: Override _predict_info instead of predict
+    def _predict_info(self, adata, X, sf, batch_size):
+        # Conditional dispersion depends on input X
+        # Predict dispersion using the standardized input features (X) prepared by Autoencoder.predict
+        adata.obsm["X_dca_dispersion"] = self.extra_models["dispersion"].predict(X, batch_size=batch_size, verbose=0)
 
     def write(self, adata, file_path, mode="denoise", colnames=None):
         colnames = adata.var_names.values if colnames is None else colnames
@@ -479,17 +473,22 @@ class NBSharedAutoencoder(NBAutoencoder):
             name="mean",
         )(self.decoder_output)
         output = Multiply(name="output_scaled")([mean, self.sf_layer])
-        output = SliceLayer(0, name="slice")([output, disp])
+        # Broadcast disp from (B, 1) to (B, G)
+        disp_bcast = keras.layers.Lambda(
+             lambda t: t[0] * ops.ones_like(t[1]),
+             name="broadcast_disp"
+        )([disp, mean])
 
-        nb = NB(theta=disp, debug=self.debug)
-        self.loss = nb.loss
+        # Pack [mu | theta]
+        packed = Concatenate(axis=-1, name="pack")([output, disp_bcast])
+        self.loss = None # Let train.py choose PackedNBLoss
         self.extra_models["dispersion"] = Model(inputs=self.input_layer, outputs=disp)
         self.extra_models["mean_norm"] = Model(inputs=self.input_layer, outputs=mean)
         self.extra_models["decoded"] = Model(
             inputs=self.input_layer, outputs=self.decoder_output
         )
 
-        self.model = Model(inputs=[self.input_layer, self.sf_layer], outputs=output)
+        self.model = Model(inputs=[self.input_layer, self.sf_layer], outputs=packed)
         self.encoder = self.get_encoder()
 
 
@@ -539,20 +538,17 @@ class ZINBAutoencoder(Autoencoder):
         self.encoder = self.get_encoder()
 
     def predict(
-        self, adata, mode="denoise", return_info=False, copy=False, colnames=None
+        self, adata, mode="denoise", return_info=False, copy=False, batch_size=256, colnames=None
     ):
+        # The signature must match the base class or be compatible if called directly.
+        # We adjust the call to super() to include the batch_size parameter.
+        return super().predict(adata, mode, return_info, copy, batch_size=batch_size)
 
-        adata_input = adata.copy() if copy else adata
-
-        if return_info:
-            X_dense = adata_input.X.toarray() if sp.issparse(adata_input.X) else np.asarray(adata_input.X)
-            X_input = np.ascontiguousarray(X_dense, dtype=np.float32)
-            adata_input.obsm["X_dca_dispersion"] = self.extra_models["dispersion"].predict(X_input, batch_size=256, verbose=0)
-            adata_input.obsm["X_dca_dropout"] = self.extra_models["pi"].predict(X_input, batch_size=256, verbose=0)
-
-        # 3. Call base implementation. copy=False because we handled it.
-        super().predict(adata_input, mode, return_info, copy=False)
-        return adata_input if copy else None
+    # Optimization: Override _predict_info instead
+    def _predict_info(self, adata, X, sf, batch_size):
+        # Use the standardized input features (X) prepared by Autoencoder.predict
+        adata.obsm["X_dca_dispersion"] = self.extra_models["dispersion"].predict(X, batch_size=batch_size, verbose=0)
+        adata.obsm["X_dca_dropout"] = self.extra_models["pi"].predict(X, batch_size=batch_size, verbose=0)
 
     def write(self, adata, file_path, mode="denoise", colnames=None):
         colnames = adata.var_names.values if colnames is None else colnames
@@ -624,10 +620,7 @@ class ZINBAutoencoderElemPi(ZINBAutoencoder):
 
         output = Multiply(name="output_scaled")([mean, self.sf_layer])
 
-        packed = keras.layers.Lambda(
-            lambda l: ops.concatenate([l[0], l[1], l[2]], axis=-1),
-            name="pack"
-        )([output, disp, pi_bcast]) # pi_bcast is (B, G)
+        packed = Concatenate(axis=-1, name="pack")([output, disp, pi_bcast]) # pi_bcast is (B, G)
 
         self.ridge_lambda_for_loss = self.ridge 
         self.loss = None
@@ -683,10 +676,7 @@ class ZINBSharedAutoencoder(ZINBAutoencoder):
 
         output = Multiply(name="output_scaled")([mean, self.sf_layer])
 
-        packed = keras.layers.Lambda(
-            lambda l: ops.concatenate([l[0], l[1], l[2]], axis=-1),
-            name="pack"
-        )([output, disp_bcast, pi_bcast])
+        packed = Concatenate(axis=-1, name="pack")([output, disp_bcast, pi_bcast])
 
         self.ridge_lambda_for_loss = self.ridge 
         self.loss = None
@@ -758,24 +748,19 @@ class ZINBConstantDispAutoencoder(Autoencoder):
         self.model = Model(inputs=[self.input_layer, self.sf_layer], outputs=packed)
         self.encoder = self.get_encoder()
 
-    def predict(self, adata, mode="denoise", return_info=False, copy=False):
-        adata_input = adata.copy() if copy else adata
-
-
-        if return_info:
-            # 1. Constant dispersion retrieval (with robustness checks)
-            disp_values = self.extra_models["dispersion"]()
-            if disp_values is not None:
-                if len(disp_values) == adata_input.n_vars:
-                    adata_input.var["X_dca_dispersion"] = disp_values
-                else:
-                    print(f"dca: Warning: Mismatch between model dispersion parameters ({len(disp_values)}) and adata genes ({adata_input.n_vars}). Skipping dispersion output.")
-            # 2. Conditional dropout (pi) prediction
-            X_dense = adata_input.X.toarray() if sp.issparse(adata_input.X) else np.asarray(adata_input.X)
-            X_input = np.ascontiguousarray(X_dense, dtype=np.float32)
-            adata_input.obsm["X_dca_dropout"] = self.extra_models["pi"].predict(X_input, batch_size=256, verbose=0)
-        super().predict(adata_input, mode, return_info, copy=False)
-        return adata_input if copy else None
+    # Optimization: Override _predict_info instead of predict
+    def _predict_info(self, adata, X, sf, batch_size):
+        # 1. Constant dispersion retrieval (with robustness checks)
+        disp_values = self.extra_models["dispersion"]()
+        if disp_values is not None:
+            if len(disp_values) == adata.n_vars:
+                adata.var["X_dca_dispersion"] = disp_values
+            else:
+                print(f"dca: Warning: Mismatch between model dispersion parameters ({len(disp_values)}) and adata genes ({adata.n_vars}). Skipping dispersion output.")
+        
+        # 2. Conditional dropout (pi) prediction
+        # Use the standardized input features (X)
+        adata.obsm["X_dca_dropout"] = self.extra_models["pi"].predict(X, batch_size=batch_size, verbose=0)
 
     def write(self, adata, file_path, mode="denoise", colnames=None):
         colnames = adata.var_names.values if colnames is None else colnames
@@ -952,10 +937,7 @@ class ZINBForkAutoencoder(ZINBAutoencoder):
 
         output = Multiply(name="output_scaled")([mean, self.sf_layer])
         
-        packed = keras.layers.Lambda(
-            lambda l: ops.concatenate([l[0], l[1], l[2]], axis=-1),
-            name="pack"
-        )([output, disp, pi])
+        packed = Concatenate(axis=-1, name="pack")([output, disp, pi])
         
         self.ridge_lambda_for_loss = self.ridge 
         self.loss = None
@@ -1097,15 +1079,13 @@ class NBForkAutoencoder(NBAutoencoder):
         )(self.last_hidden_mean)
 
         output = Multiply(name="output_scaled")([mean, self.sf_layer])
-        output = SliceLayer(0, name="slice")([output, disp])
-
-        nb = NB(theta=disp, debug=self.debug)
-        self.loss = nb.loss
+        # Pack [mu | theta]
+        packed = Concatenate(axis=-1, name="pack")([output, disp])
+        self.loss = None # Let train.py choose PackedNBLoss
         self.extra_models["dispersion"] = Model(inputs=self.input_layer, outputs=disp)
         self.extra_models["mean_norm"] = Model(inputs=self.input_layer, outputs=mean)
 
-        self.model = Model(inputs=[self.input_layer, self.sf_layer], outputs=output)
-
+        self.model = Model(inputs=[self.input_layer, self.sf_layer], outputs=packed)
         self.encoder = self.get_encoder()
 
 
