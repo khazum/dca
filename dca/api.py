@@ -150,9 +150,8 @@ def dca(adata,
     # set seed for reproducibility
     random.seed(random_state)
     np.random.seed(random_state)
-    keras.utils.set_random_seed(42)
-
-    os.environ['PYTHONHASHSEED'] = '0'
+    # Use the provided random_state for Keras/TF seeding as well
+    keras.utils.set_random_seed(random_state)
 
     # this creates adata.raw with raw counts and copies adata if copy==True
     adata = read_dataset(adata,

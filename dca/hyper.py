@@ -20,7 +20,7 @@ except Exception as e:
 
 from . import io
 from .network import AE_types
-from .train import WrappedLoss, PackedNBLoss  # use the same loss logic as training
+from .loss import WrappedLoss, PackedNBLoss, PackedZINBLoss # Import reorganized losses
 
 
 @dataclass
@@ -65,13 +65,11 @@ class DCAHyperModel(kt.HyperModel):
                            max_value=SearchSpace().dropout_range[1], step=0.05)
         input_dropout = hp.Float("input_dropout", min_value=SearchSpace().input_dropout_range[0],
                                  max_value=SearchSpace().input_dropout_range[1], step=0.05)
-        ridge = hp.Float("ridge", min_value=np.log10(SearchSpace().ridge[0]),
-                         max_value=np.log10(SearchSpace().ridge[1]), sampling="linear")
-        l1_enc_coef = hp.Float("l1_enc_coef", min_value=np.log10(SearchSpace().l1_enc_coef[0]),
-                               max_value=np.log10(SearchSpace().l1_enc_coef[1]), sampling="linear")
-        # exponentiate logged params
-        ridge = float(10.0 ** ridge)
-        l1_enc_coef = float(10.0 ** l1_enc_coef)
+        # Simplify: Use Keras Tuner's built-in logarithmic sampling
+        ridge = hp.Float("ridge", min_value=SearchSpace().ridge[0],
+                         max_value=SearchSpace().ridge[1], sampling="log")
+        l1_enc_coef = hp.Float("l1_enc_coef", min_value=SearchSpace().l1_enc_coef[0],
+                               max_value=SearchSpace().l1_enc_coef[1], sampling="log")
 
         # --- Build network with the sampled hyperparameters
         net = AE_types[aetype](
@@ -92,19 +90,29 @@ class DCAHyperModel(kt.HyperModel):
         net.build()
 
         # optimizer
-        lr_log10 = hp.Float("lr_log10", min_value=np.log10(SearchSpace().lr[0]),
-                            max_value=np.log10(SearchSpace().lr[1]), sampling="linear")
-        lr = float(10.0 ** lr_log10)
+        lr = hp.Float("lr", min_value=SearchSpace().lr[0],
+                      max_value=SearchSpace().lr[1], sampling="log")
 
         # Build optimizer from its name (e.g. "RMSprop")
         opt_cls = getattr(opt, self.optimizer_name)
         optimizer = opt_cls(learning_rate=lr, clipvalue=5.0)
 
-        # Use same loss logic as training so we stay consistent across model types
-        if any(l.name == "pack" for l in net.model.layers):
-            loss_fn = PackedNBLoss()
-        else:
+        # BUG FIX: The previous logic defaulted to PackedNBLoss if 'pack' existed, ignoring ZINB.
+        # We must replicate the logic from train.py to select the correct loss based on output shape.
+        is_packed = any(l.name == "pack" for l in net.model.layers)
+        if not is_packed:
             loss_fn = WrappedLoss(net.loss)
+        else:
+            output_dim = net.model.output_shape[-1]
+            genes_dim = net.output_size
+
+            if output_dim == 2 * genes_dim:
+                loss_fn = PackedNBLoss()
+            elif output_dim == 3 * genes_dim:
+                # Crucial: Use the ridge parameter sampled by the tuner for ZINB loss
+                loss_fn = PackedZINBLoss(ridge_lambda=ridge)
+            else:
+                raise ValueError(f"Inconsistent packed output dimension {output_dim} for {genes_dim} genes.")
 
         net.model.compile(optimizer=optimizer, loss=loss_fn, run_eagerly=False, jit_compile=False)
         return net.model

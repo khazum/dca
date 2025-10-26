@@ -29,13 +29,14 @@ import scipy.sparse as sp
 from .loss import poisson_loss, NB, ZINB
 from .layers import (
     ConstantDispersionLayer,
-    SliceLayer,
     ElementwiseDense,
 )
 from .io import write_text_matrix
 
 def maybe_l1_l2(l1, l2):
-    return l1_l2(l1, l2) if (l1 and l1 > 0) or (l2 and l2 > 0) else None
+    if (l1 is not None and l1 > 0) or (l2 is not None and l2 > 0):
+        return l1_l2(l1=l1 or 0.0, l2=l2 or 0.0)
+    return None
 
 MeanAct = lambda x: ops.clip(ops.exp(x), 1e-5, 1e6)
 DispAct = lambda x: ops.clip(ops.softplus(x), 1e-4, 1e4)
@@ -770,7 +771,7 @@ class ZINBConstantDispAutoencoder(Autoencoder):
 
         if "X_dca_dispersion" in adata.var_keys():
             write_text_matrix(
-                adata.var["X_dca_dispersion"].values.reshape(1, -1),
+                np.asarray(adata.var["X_dca_dispersion"]).reshape(1, -1),
                 os.path.join(file_path, "dispersion.tsv"),
                 colnames=colnames,
                 transpose=True,

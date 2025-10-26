@@ -13,40 +13,13 @@
 # limitations under the License.
 # ==============================================================================
 
-
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import pickle
 
 import numpy as np
-import scipy as sp
+import scipy.sparse as sp_sparse
 import pandas as pd
 import scanpy as sc
 from sklearn.model_selection import train_test_split
-
-#TODO: Fix this
-class AnnSequence:
-    def __init__(self, matrix, batch_size, sf=None):
-        self.matrix = matrix
-        if sf is None:
-            self.size_factors = np.ones((self.matrix.shape[0], 1),
-                                        dtype=np.float32)
-        else:
-            self.size_factors = sf
-        self.batch_size = batch_size
-
-    def __len__(self):
-        return len(self.matrix) // self.batch_size
-
-    def __getitem__(self, idx):
-        batch = self.matrix[idx*self.batch_size:(idx+1)*self.batch_size]
-        batch_sf = self.size_factors[idx*self.batch_size:(idx+1)*self.batch_size]
-
-        # return an (X, Y) pair
-        return {'count': batch, 'size_factors': batch_sf}, batch
-
 
 def read_dataset(adata, transpose=False, test_split=False, copy=False, check_counts=True):
 
@@ -62,7 +35,7 @@ def read_dataset(adata, transpose=False, test_split=False, copy=False, check_cou
         # check if observations are unnormalized using first 10
         X_subset = adata.X[:10]
         norm_error = 'Make sure that the dataset (adata.X) contains unnormalized count data.'
-        if sp.sparse.issparse(X_subset):
+        if sp_sparse.issparse(X_subset):
             assert (X_subset.astype(int) != X_subset).nnz == 0, norm_error
         else:
             assert np.all(X_subset.astype(int) == X_subset), norm_error
@@ -96,7 +69,7 @@ def normalize(adata, filter_min_counts=True, size_factors=True, normalize_input=
 
     if size_factors:
         # Compute per-cell library sizes (float) before normalization
-        if sp.sparse.issparse(adata.X):
+        if sp_sparse.issparse(adata.X):
             n_counts = np.asarray(adata.X.sum(axis=1)).ravel()
         else:
             n_counts = np.asarray(adata.X.sum(axis=1)).ravel()

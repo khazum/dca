@@ -55,9 +55,15 @@ def _optimize_zinb(mu, dropout, theta=None):
 
 def plot_mean_dropout(ad, title, ax, opt_zinb_theta=False, legend_out=False):
     expr = ad.X
-    mu = expr.mean(0)
-    do = np.mean(expr == 0, 0)
-    v = expr.var(axis=0)
+    if sp.sparse.issparse(expr):
+        mu = np.asarray(expr.mean(0)).flatten()
+        # Calculate dropout rate efficiently for sparse matrix
+        do = np.asarray(1 - (expr.getnnz(axis=0) / expr.shape[0])).flatten()
+        v = np.asarray(expr.var(axis=0)).flatten()
+    else:
+        mu = expr.mean(0)
+        do = np.mean(expr == 0, 0)
+        v = expr.var(axis=0)
 
     coefs, r2 = _fitquad(mu, v)
     theta = 1.0/coefs[0]
@@ -106,8 +112,13 @@ def plot_mean_var(ad, title, ax):
     sc.pp.filter_cells(ad, min_counts=1)
     sc.pp.filter_genes(ad, min_counts=1)
 
-    m = ad.X.mean(axis=0)
-    v = ad.X.var(axis=0)
+    # Handle sparse matrices efficiently
+    if sp.sparse.issparse(ad.X):
+        m = np.asarray(ad.X.mean(axis=0)).flatten()
+        v = np.asarray(ad.X.var(axis=0)).flatten()
+    else:
+        m = ad.X.mean(axis=0)
+        v = ad.X.var(axis=0)
 
     coefs, r2 = _fitquad(m, v)
 

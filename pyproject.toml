@@ -14,12 +14,18 @@ license = { text = "Apache License 2.0" }
 classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
 ]
+requires-python = ">=3.9"
+
 
 # This section replaces 'install_requires'
 dependencies = [
     "tensorflow[and-cuda]>=2.20.0",
+    "keras>=3.0",
     "numpy",
     "h5py",
     "six",
@@ -27,6 +33,12 @@ dependencies = [
     "scanpy",
     "keras-tuner",
     "pandas",
+]
+
+[project.optional-dependencies]
+visualization = [
+    "matplotlib",
+    "seaborn",
 ]
 
 [project.urls]
