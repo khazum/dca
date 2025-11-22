@@ -43,7 +43,6 @@ DispAct = lambda x: ops.clip(ops.softplus(x), 1e-4, 1e4)
 
 advanced_activations = ("PReLU", "LeakyReLU")
 
-
 class Autoencoder:
     def __init__(
         self,
@@ -538,19 +537,17 @@ class ZINBAutoencoder(Autoencoder):
 
         self.encoder = self.get_encoder()
 
-    def predict(
-        self, adata, mode="denoise", return_info=False, copy=False, batch_size=256, colnames=None
-    ):
+    def predict(self, adata, mode="denoise", return_info=False, copy=False, batch_size=256, colnames=None):
         # The signature must match the base class or be compatible if called directly.
         # We adjust the call to super() to include the batch_size parameter.
         return super().predict(adata, mode, return_info, copy, batch_size=batch_size)
 
-    # Optimization: Override _predict_info instead
+# Optimization: Override _predict_info instead
     def _predict_info(self, adata, X, sf, batch_size):
         # Use the standardized input features (X) prepared by Autoencoder.predict
         adata.obsm["X_dca_dispersion"] = self.extra_models["dispersion"].predict(X, batch_size=batch_size, verbose=0)
         adata.obsm["X_dca_dropout"] = self.extra_models["pi"].predict(X, batch_size=batch_size, verbose=0)
-
+        
     def write(self, adata, file_path, mode="denoise", colnames=None):
         colnames = adata.var_names.values if colnames is None else colnames
         rownames = adata.obs_names.values
@@ -600,10 +597,17 @@ class ZINBAutoencoderElemPi(ZINBAutoencoder):
         mean_no_act_neg = minus(mean_no_act)
         pidim = self.output_size if not self.sharedpi else 1
 
+        # MODIFICATION: Initialize W=1 (k_init='ones'), B=0 (b_init='zeros').
+        # pi = sigmoid(W*(-log(mu)) + B) -> sigmoid(-log(mu)) = 1/(1+mu)
+        # This provides a strong, biologically plausible starting point.
+        k_init = 'ones'
+        b_init = 'zeros'
+
         pi = ElementwiseDense(
             pidim,
             activation="sigmoid",
-            kernel_initializer=self.init,
+            kernel_initializer=k_init, # Changed from self.init
+            bias_initializer=b_init,   # Added
             kernel_regularizer=maybe_l1_l2(self.l1_coef, self.l2_coef),
             name="pi",
         )(mean_no_act_neg)
