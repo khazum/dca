@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
 import scipy as sp
-from scipy.optimize import minimize
+from scipy.optimize import minimize, curve_fit
 
 nb_zero = lambda t, mu: (t/(mu+t))**t
 zinb_zero = lambda t, mu, p: p + ((1.-p)*((t/(mu+t))**t))
@@ -130,10 +130,10 @@ def plot_mean_var(ad, title, ax):
 
     ax.set_title(title)
     ax.set_ylabel('Variance')
-    ax.set_xlabel(r'$\mu$')
+    ax.set_xlabel(r'$\\mu$')
 
     sns.lineplot(m, m, ax=ax, color='blue')
-    ax.legend(['Genes', r'NB ($\theta=%.2f)\ r^2=%.3f$' % (coefs[0], r2), 'Poisson'])
+    ax.legend(['Genes', r'NB ($\\theta=%.2f)\\ r^2=%.3f$' % (coefs[0], r2), 'Poisson'])
 
     return coefs[0]
 
