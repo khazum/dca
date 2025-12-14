@@ -26,10 +26,11 @@ from keras.losses import MeanSquaredError
 from keras import ops
 import scipy.sparse as sp
 
-from .loss import poisson_loss
+from .loss import poisson_loss, _nb_nll, _reduce_mean
 from .layers import (
     ConstantDispersionLayer,
     ElementwiseDense,
+    lgamma,
 )
 from .io import write_text_matrix
 
@@ -39,9 +40,39 @@ def maybe_l1_l2(l1, l2):
     return None
 
 MeanAct = lambda x: ops.clip(ops.exp(x), 1e-5, 1e6)
+# Match the original DCA bounds for dispersion
 DispAct = lambda x: ops.clip(ops.softplus(x), 1e-4, 1e4)
 
 advanced_activations = ("PReLU", "LeakyReLU")
+
+# --- Legacy-style loss closures (match DCA-0.3.4 behavior) ---
+def _legacy_nb_loss(theta_tensor, eps=1e-10):
+    """NB loss using internal theta tensor; averages over all elements when mean=True."""
+    def loss(y_true, mu, mean=True):
+        eps_t = ops.cast(eps, mu.dtype)
+        theta = ops.minimum(theta_tensor, ops.cast(1e6, theta_tensor.dtype))
+        nb = _nb_nll(y_true, mu, theta, eps_t)
+        return _reduce_mean(nb) if mean else nb
+    return loss
+
+def _legacy_zinb_loss(pi_tensor, theta_tensor, ridge_lambda=0.0, eps=1e-10):
+    """ZINB loss using internal pi/theta tensors; matches original DCA formulation."""
+    def loss(y_true, mu, mean=True):
+        eps_t = ops.cast(eps, mu.dtype)
+        theta = ops.minimum(theta_tensor, ops.cast(1e6, theta_tensor.dtype))
+        mu = ops.maximum(mu, eps_t)
+
+        nb = _nb_nll(y_true, mu, theta, eps_t)
+        nb_case = nb - ops.log(ops.cast(1.0, pi_tensor.dtype) - pi_tensor + eps_t)
+
+        zero_nb = ops.power(theta / (theta + mu + eps_t), theta)
+        zero_case = -ops.log(pi_tensor + (ops.cast(1.0, pi_tensor.dtype) - pi_tensor) * zero_nb + eps_t)
+
+        result = ops.where(ops.less(y_true, ops.cast(1e-8, y_true.dtype)), zero_case, nb_case)
+        if ridge_lambda > 0:
+            result += ops.cast(ridge_lambda, result.dtype) * ops.square(pi_tensor)
+        return _reduce_mean(result) if mean else result
+    return loss
 
 
 class Autoencoder:
@@ -241,7 +272,7 @@ class Autoencoder:
 
         # Optimization: Prepare inputs once
         X, sf = self._prepare_inputs(adata)
-        inputs = [X, sf]
+        inputs = {'count': X, 'size_factors': sf}
 
         # Optimization: Allow subclasses to perform predictions using extra models if return_info=True
         if return_info:
@@ -343,18 +374,15 @@ class NBConstantDispAutoencoder(Autoencoder):
             kernel_regularizer=maybe_l1_l2(self.l1_coef, self.l2_coef),
             name="mean",
         )(self.decoder_output)
-        # 2. Scaled mean (mu)
-        # OPTIMIZATION: Replace ColwiseMultLayer
+
+        # Dispersion (theta) - constant, broadcast to genes
+        disp_layer = ConstantDispersionLayer(name="dispersion")
+        theta_bcast = disp_layer(mean)  # (B, G)
+
+        # Scaled mean (mu)
         output = Multiply(name="output_scaled")([mean, self.sf_layer])
 
-        # FIX Gradient Flow: Use the redesigned ConstantDispersionLayer
-        # 3. Dispersion (theta)
-        disp_layer = ConstantDispersionLayer(name="dispersion")
-        # Pass 'output' (B, G) for batch size inference. This ensures gradient flow.
-        theta_bcast = disp_layer(output)
-
-        # 4. Pack [μ | θ]
-        # OPTIMIZATION: Replace Packing Lambda with native Concatenate
+        # Pack [μ | θ] for packed loss
         packed = Concatenate(axis=-1, name="pack")([output, theta_bcast])
 
         # Let train.py choose PackedNBLoss
@@ -367,6 +395,7 @@ class NBConstantDispAutoencoder(Autoencoder):
             try:
                 # We access the weight by index 0 (theta_raw)
                 theta_w_raw = self.model.get_layer("dispersion").get_weights()[0]
+                # Match dispersion bounds used in ConstantDispersionLayer
                 return np.squeeze(np.clip(np.exp(theta_w_raw), 1e-3, 1e4))
             except Exception as e:
                 print(f"dca: Warning: Could not retrieve dispersion weights: {e}")
@@ -376,7 +405,7 @@ class NBConstantDispAutoencoder(Autoencoder):
         self.extra_models["mean_norm"] = Model(inputs=self.input_layer, outputs=mean)
         self.extra_models["decoded"] = Model(inputs=self.input_layer, outputs=self.decoder_output)
 
-        # Model now outputs packed [μ | θ]
+        # Model outputs packed [μ | θ]
         self.model = Model(inputs=[self.input_layer, self.sf_layer], outputs=packed)
         self.encoder = self.get_encoder()
 
@@ -426,7 +455,6 @@ class NBAutoencoder(Autoencoder):
         )(self.decoder_output)
         output = Multiply(name="output_scaled")([mean, self.sf_layer])
         packed = Concatenate(axis=-1, name="pack")([output, disp])
-
 
         # keep for inspection; training will override self.loss
         # Let train.py choose PackedNBLoss
@@ -494,16 +522,13 @@ class NBSharedAutoencoder(NBAutoencoder):
 
 
 class ZINBAutoencoder(Autoencoder):
+    """
+    (MODIFIED) ZINB Autoencoder with Conditional Dispersion (zinb-conddisp).
+    Uses per-gene dropout probabilities as in the original DCA paper.
+    """
 
     def build_output(self):
-        pi = Dense(
-            self.output_size,
-            activation="sigmoid",
-            kernel_initializer=self.init,
-            kernel_regularizer=maybe_l1_l2(self.l1_coef, self.l2_coef),
-            name="pi",
-        )(self.decoder_output)
-
+        # Dispersion (Conditional)
         disp = Dense(
             self.output_size,
             activation=DispAct,
@@ -512,6 +537,17 @@ class ZINBAutoencoder(Autoencoder):
             name="dispersion",
         )(self.decoder_output)
 
+        # Dropout probability (pi)
+        pi = Dense(
+            self.output_size,
+            activation="sigmoid",
+            kernel_initializer=self.init,
+            kernel_regularizer=maybe_l1_l2(self.l1_coef, self.l2_coef),
+            bias_initializer=keras.initializers.Constant(-5.0),
+            name="pi",
+        )(self.decoder_output)
+
+        # Mean
         mean = Dense(
             self.output_size,
             activation=MeanAct,
@@ -519,14 +555,18 @@ class ZINBAutoencoder(Autoencoder):
             kernel_regularizer=maybe_l1_l2(self.l1_coef, self.l2_coef),
             name="mean",
         )(self.decoder_output)
-        output = Multiply(name="output_scaled")([mean, self.sf_layer])
-        
-        packed = Concatenate(axis=-1, name="pack")([output, disp, pi])
-        
-        # Store ridge_lambda for the loss constructor in train.py
-        self.ridge_lambda_for_loss = self.ridge 
-        self.loss = None # This will be replaced in dca/train.py
 
+        # Scaled output (mu)
+        output = Multiply(name="output_scaled")([mean, self.sf_layer])
+
+        # Pack [mu, theta, pi] for packed loss
+        packed = Concatenate(axis=-1, name="pack")([output, disp, pi])
+
+        # Store ridge_lambda for the loss constructor in train.py
+        self.ridge_lambda_for_loss = self.ridge
+        self.loss = None  # Set in dca/train.py
+
+        # Extra models for introspection
         self.extra_models["pi"] = Model(inputs=self.input_layer, outputs=pi)
         self.extra_models["dispersion"] = Model(inputs=self.input_layer, outputs=disp)
         self.extra_models["mean_norm"] = Model(inputs=self.input_layer, outputs=mean)
@@ -580,6 +620,7 @@ class ZINBAutoencoderElemPi(ZINBAutoencoder):
         self.sharedpi = sharedpi
 
     def build_output(self):
+        # 1. Dispersion
         disp = Dense(
             self.output_size,
             activation=DispAct,
@@ -588,6 +629,7 @@ class ZINBAutoencoderElemPi(ZINBAutoencoder):
             name="dispersion",
         )(self.decoder_output)
 
+        # 2. Mean (Pre-activation)
         mean_no_act = Dense(
             self.output_size,
             activation=None,
@@ -596,21 +638,26 @@ class ZINBAutoencoderElemPi(ZINBAutoencoder):
             name="mean_no_act",
         )(self.decoder_output)
 
+        # 3. Pi (ElemPi structure)
         minus = Lambda(lambda x: -x)
         mean_no_act_neg = minus(mean_no_act)
-        pidim = self.output_size if not self.sharedpi else 1
+        
+        # Determine Pi dimensions (Shared or Per-gene)
+        pidim = 1 if self.sharedpi else self.output_size
 
         pi = ElementwiseDense(
             pidim,
             activation="sigmoid",
             kernel_initializer=self.init,
-            kernel_regularizer=maybe_l1_l2(self.l1_coef, self.l2_coef),
+            kernel_regularizer=maybe_l1_l2(0.0, self.l2_coef),
+            bias_initializer=keras.initializers.Constant(-5.0),
             name="pi",
         )(mean_no_act_neg)
 
+        # 4. Mean (Activated)
         mean = Activation(MeanAct, name="mean")(mean_no_act)
 
-        # Handle sharedpi broadcast
+        # Handle sharedpi broadcast for packing
         if self.sharedpi:
             pi_bcast = keras.layers.Lambda(
                 lambda t: t[0] * ops.ones_like(t[1]),  # (B,1) -> (B,G)
@@ -619,14 +666,18 @@ class ZINBAutoencoderElemPi(ZINBAutoencoder):
         else:
             pi_bcast = pi
 
+
+        # 5. Scaled Output (Mu)
         output = Multiply(name="output_scaled")([mean, self.sf_layer])
 
-        packed = Concatenate(axis=-1, name="pack")([output, disp, pi_bcast]) # pi_bcast is (B, G)
+        # 6. Pack [Mu, Theta, Pi]
+        packed = Concatenate(axis=-1, name="pack")([output, disp, pi_bcast])
 
         self.ridge_lambda_for_loss = self.ridge 
         self.loss = None
 
-        self.extra_models["pi"] = Model(inputs=self.input_layer, outputs=pi) # Original pi
+        # Extra models
+        self.extra_models["pi"] = Model(inputs=self.input_layer, outputs=pi) 
         self.extra_models["dispersion"] = Model(inputs=self.input_layer, outputs=disp)
         self.extra_models["mean_norm"] = Model(inputs=self.input_layer, outputs=mean)
         self.extra_models["decoded"] = Model(
@@ -639,16 +690,13 @@ class ZINBAutoencoderElemPi(ZINBAutoencoder):
 
 
 class ZINBSharedAutoencoder(ZINBAutoencoder):
+    """
+    (MODIFIED) ZINB Autoencoder with Shared Parameters (zinb-shared).
+    Shared pi/dispersion are learned directly from decoder outputs.
+    """
 
     def build_output(self):
-        pi = Dense(
-            1,
-            activation="sigmoid",
-            kernel_initializer=self.init,
-            kernel_regularizer=maybe_l1_l2(self.l1_coef, self.l2_coef),
-            name="pi",
-        )(self.decoder_output)
-
+        # Shared dispersion (B, 1)
         disp = Dense(
             1,
             activation=DispAct,
@@ -657,6 +705,17 @@ class ZINBSharedAutoencoder(ZINBAutoencoder):
             name="dispersion",
         )(self.decoder_output)
 
+        # Shared dropout probability (pi) (B, 1)
+        pi = Dense(
+            1,
+            activation="sigmoid",
+            kernel_initializer=self.init,
+            kernel_regularizer=maybe_l1_l2(self.l1_coef, self.l2_coef),
+            bias_initializer=keras.initializers.Constant(-5.0),
+            name="pi",
+        )(self.decoder_output)
+
+        # Mean
         mean = Dense(
             self.output_size,
             activation=MeanAct,
@@ -664,24 +723,21 @@ class ZINBSharedAutoencoder(ZINBAutoencoder):
             kernel_regularizer=maybe_l1_l2(self.l1_coef, self.l2_coef),
             name="mean",
         )(self.decoder_output)
-        
-        # Need to broadcast pi and disp from (B, 1) to (B, G)
+
+        # Broadcast shared parameters from (B,1) to (B,G)
         pi_bcast = keras.layers.Lambda(
-            lambda t: t[0] * ops.ones_like(t[1]),
-            name="broadcast_pi"
+            lambda t: t[0] * ops.ones_like(t[1]), name="broadcast_pi"
         )([pi, mean])
         disp_bcast = keras.layers.Lambda(
-            lambda t: t[0] * ops.ones_like(t[1]),
-            name="broadcast_disp"
+            lambda t: t[0] * ops.ones_like(t[1]), name="broadcast_disp"
         )([disp, mean])
 
         output = Multiply(name="output_scaled")([mean, self.sf_layer])
-
         packed = Concatenate(axis=-1, name="pack")([output, disp_bcast, pi_bcast])
-
-        self.ridge_lambda_for_loss = self.ridge 
+        self.ridge_lambda_for_loss = self.ridge
         self.loss = None
-        
+
+        # Extra models (raw shared parameters Bx1)
         self.extra_models["pi"] = Model(inputs=self.input_layer, outputs=pi)
         self.extra_models["dispersion"] = Model(inputs=self.input_layer, outputs=disp)
         self.extra_models["mean_norm"] = Model(inputs=self.input_layer, outputs=mean)
@@ -694,16 +750,23 @@ class ZINBSharedAutoencoder(ZINBAutoencoder):
 
 
 class ZINBConstantDispAutoencoder(Autoencoder):
+    """
+    (MODIFIED) ZINB Autoencoder with Constant Dispersion (zinb).
+    Mirrors the original DCA zinb architecture (pi learned from decoder output).
+    """
 
     def build_output(self):
+        # Dropout probability (pi)
         pi = Dense(
             self.output_size,
             activation="sigmoid",
             kernel_initializer=self.init,
             kernel_regularizer=maybe_l1_l2(self.l1_coef, self.l2_coef),
+            bias_initializer=keras.initializers.Constant(-5.0),
             name="pi",
         )(self.decoder_output)
 
+        # Mean
         mean = Dense(
             self.output_size,
             activation=MeanAct,
@@ -712,29 +775,24 @@ class ZINBConstantDispAutoencoder(Autoencoder):
             name="mean",
         )(self.decoder_output)
 
-        # 3. Scaled Mean (mu)
-        # OPTIMIZATION: Replace ColwiseMultLayer
+        # Dispersion (theta) - Constant Layer
+        disp_layer = ConstantDispersionLayer(name="dispersion")
+        theta_bcast = disp_layer(mean)
+
+        # Scaled mean (mu)
         output = Multiply(name="output_scaled")([mean, self.sf_layer])
 
-        # FIX Gradient Flow: Use the redesigned ConstantDispersionLayer
-        # 4. Dispersion (theta)
-        disp_layer = ConstantDispersionLayer(name="dispersion")
-        # Use 'output' (B, G) for batch size inference and ensure gradient flow.
-        theta_bcast = disp_layer(output)
-
-        # 5. Pack [mu, theta, pi]
-        # OPTIMIZATION: Replace Packing Lambda
+        # Pack [mu, theta, pi]
         packed = Concatenate(axis=-1, name="pack")([output, theta_bcast, pi])
-        
-        self.ridge_lambda_for_loss = self.ridge 
+
+        self.ridge_lambda_for_loss = self.ridge
         self.loss = None
 
-        # Introspection helpers (updated)
+        # Introspection helpers
         self.extra_models["pi"] = Model(inputs=self.input_layer, outputs=pi)
         def _disp():
             import numpy as np
             try:
-                # Access the weight by index 0 (theta_raw)
                 theta_w_raw = self.model.get_layer("dispersion").get_weights()[0]
                 return np.squeeze(np.clip(np.exp(theta_w_raw), 1e-3, 1e4))
             except Exception as e:
@@ -749,29 +807,29 @@ class ZINBConstantDispAutoencoder(Autoencoder):
         self.model = Model(inputs=[self.input_layer, self.sf_layer], outputs=packed)
         self.encoder = self.get_encoder()
 
-    # Optimization: Override _predict_info instead of predict
+    # Populate dispersion (var) and dropout (obsm) when requested
     def _predict_info(self, adata, X, sf, batch_size):
-        # 1. Constant dispersion retrieval (with robustness checks)
+        # Dispersion is constant; read from the layer weights
         disp_values = self.extra_models["dispersion"]()
-        if disp_values is not None:
-            if len(disp_values) == adata.n_vars:
-                adata.var["X_dca_dispersion"] = disp_values
-            else:
-                print(f"dca: Warning: Mismatch between model dispersion parameters ({len(disp_values)}) and adata genes ({adata.n_vars}). Skipping dispersion output.")
-        
-        # 2. Conditional dropout (pi) prediction
-        # Use the standardized input features (X)
-        adata.obsm["X_dca_dropout"] = self.extra_models["pi"].predict(X, batch_size=batch_size, verbose=0)
+        if disp_values is not None and len(disp_values) == adata.n_vars:
+            adata.var["X_dca_dispersion"] = disp_values
+        else:
+            print("dca: Warning: Unable to write dispersion; shape mismatch.")
+
+        # Dropout probabilities depend on input
+        adata.obsm["X_dca_dropout"] = self.extra_models["pi"].predict(
+            X, batch_size=batch_size, verbose=0
+        )
 
     def write(self, adata, file_path, mode="denoise", colnames=None):
         colnames = adata.var_names.values if colnames is None else colnames
         rownames = adata.obs_names.values
 
-        super().write(adata, file_path, mode)
+        super().write(adata, file_path, mode, colnames=colnames)
 
         if "X_dca_dispersion" in adata.var_keys():
             write_text_matrix(
-                np.asarray(adata.var["X_dca_dispersion"]).reshape(1, -1),
+                adata.var["X_dca_dispersion"].reshape(1, -1),
                 os.path.join(file_path, "dispersion.tsv"),
                 colnames=colnames,
                 transpose=True,
@@ -787,6 +845,11 @@ class ZINBConstantDispAutoencoder(Autoencoder):
 
 
 class ZINBForkAutoencoder(ZINBAutoencoder):
+    """
+    (MODIFIED) ZINB Fork Autoencoder (zinb-fork).
+    Keeps separate decoder branches for mean, dispersion, and dropout (pi) as in the
+    original DCA fork architecture.
+    """
 
     def build(self):
 
@@ -796,6 +859,10 @@ class ZINBForkAutoencoder(ZINBAutoencoder):
 
         if self.input_dropout > 0.0:
             last_hidden = Dropout(self.input_dropout, name="input_dropout")(last_hidden)
+
+        self.last_hidden_mean = None
+        self.last_hidden_disp = None
+        self.last_hidden_pi = None
 
         for i, (hid_size, hid_drop) in enumerate(
             zip(self.hidden_size, self.hidden_dropout)
@@ -823,27 +890,38 @@ class ZINBForkAutoencoder(ZINBAutoencoder):
                 l2 = self.l2_coef
 
             if i > center_idx:
+                # Initialize branches on the first decoder layer
+                if self.last_hidden_mean is None:
+                    self.last_hidden_mean = last_hidden
+                    self.last_hidden_disp = last_hidden
+                    self.last_hidden_pi = last_hidden
+
+                # Mean branch
                 self.last_hidden_mean = Dense(
                     hid_size,
                     activation=None,
                     kernel_initializer=self.init,
                     kernel_regularizer=l1_l2(l1, l2),
                     name="%s_last_mean" % layer_name,
-                )(last_hidden)
+                )(self.last_hidden_mean)
+
+                # Dispersion branch
                 self.last_hidden_disp = Dense(
                     hid_size,
                     activation=None,
                     kernel_initializer=self.init,
                     kernel_regularizer=l1_l2(l1, l2),
                     name="%s_last_disp" % layer_name,
-                )(last_hidden)
+                )(self.last_hidden_disp)
+
+                # Dropout (pi) branch
                 self.last_hidden_pi = Dense(
                     hid_size,
                     activation=None,
                     kernel_initializer=self.init,
                     kernel_regularizer=l1_l2(l1, l2),
                     name="%s_last_pi" % layer_name,
-                )(last_hidden)
+                )(self.last_hidden_pi)
 
                 if self.batchnorm:
                     self.last_hidden_mean = BatchNormalization(
@@ -852,12 +930,10 @@ class ZINBForkAutoencoder(ZINBAutoencoder):
                     self.last_hidden_disp = BatchNormalization(
                         center=True, scale=False
                     )(self.last_hidden_disp)
-                    self.last_hidden_pi = BatchNormalization(center=True, scale=False)(
-                        self.last_hidden_pi
-                    )
+                    self.last_hidden_pi = BatchNormalization(
+                        center=True, scale=False
+                    )(self.last_hidden_pi)
 
-                # Use separate act. layers to give user the option to get pre-activations
-                # of layers when requested
                 self.last_hidden_mean = Activation(
                     self.activation, name="%s_mean_act" % layer_name
                 )(self.last_hidden_mean)
@@ -893,8 +969,6 @@ class ZINBForkAutoencoder(ZINBAutoencoder):
                         last_hidden
                     )
 
-                # Use separate act. layers to give user the option to get pre-activations
-                # of layers when requested
                 if self.activation in advanced_activations:
                     last_hidden = keras.layers.__dict__[self.activation](
                         name="%s_act" % layer_name
@@ -909,17 +983,16 @@ class ZINBForkAutoencoder(ZINBAutoencoder):
                         last_hidden
                     )
 
+        # Ensure branches are initialized
+        if self.last_hidden_mean is None:
+            self.last_hidden_mean = last_hidden
+            self.last_hidden_disp = last_hidden
+            self.last_hidden_pi = last_hidden
+
         self.build_output()
 
     def build_output(self):
-        pi = Dense(
-            self.output_size,
-            activation="sigmoid",
-            kernel_initializer=self.init,
-            kernel_regularizer=maybe_l1_l2(self.l1_coef, self.l2_coef),
-            name="pi",
-        )(self.last_hidden_pi)
-
+        # Dispersion branch
         disp = Dense(
             self.output_size,
             activation=DispAct,
@@ -928,6 +1001,7 @@ class ZINBForkAutoencoder(ZINBAutoencoder):
             name="dispersion",
         )(self.last_hidden_disp)
 
+        # Mean branch
         mean = Dense(
             self.output_size,
             activation=MeanAct,
@@ -936,11 +1010,21 @@ class ZINBForkAutoencoder(ZINBAutoencoder):
             name="mean",
         )(self.last_hidden_mean)
 
+        # Pi branch
+        pi = Dense(
+            self.output_size,
+            activation="sigmoid",
+            kernel_initializer=self.init,
+            kernel_regularizer=maybe_l1_l2(self.l1_coef, self.l2_coef),
+            bias_initializer=keras.initializers.Constant(-5.0),
+            name="pi",
+        )(self.last_hidden_pi)
+
         output = Multiply(name="output_scaled")([mean, self.sf_layer])
-        
+
+        # Pack [mu | theta | pi] so training can use packed ZINB loss
         packed = Concatenate(axis=-1, name="pack")([output, disp, pi])
-        
-        self.ridge_lambda_for_loss = self.ridge 
+        self.ridge_lambda_for_loss = self.ridge
         self.loss = None
 
         self.extra_models["pi"] = Model(inputs=self.input_layer, outputs=pi)
@@ -1080,9 +1164,10 @@ class NBForkAutoencoder(NBAutoencoder):
         )(self.last_hidden_mean)
 
         output = Multiply(name="output_scaled")([mean, self.sf_layer])
-        # Pack [mu | theta]
+        # Pack [mu | theta] so training can use packed NB loss
         packed = Concatenate(axis=-1, name="pack")([output, disp])
-        self.loss = None # Let train.py choose PackedNBLoss
+        # Use packed loss selection in train.py
+        self.loss = None
         self.extra_models["dispersion"] = Model(inputs=self.input_layer, outputs=disp)
         self.extra_models["mean_norm"] = Model(inputs=self.input_layer, outputs=mean)
 

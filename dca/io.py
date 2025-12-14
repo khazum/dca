@@ -76,13 +76,15 @@ def normalize(adata, filter_min_counts=True, size_factors=True, normalize_input=
         n_counts = n_counts.astype(np.float64, copy=False)
         adata.obs['n_counts'] = n_counts
 
-        # Size factors: library size / median library size
-        adata.obs['size_factors'] = n_counts / np.median(n_counts)
+        # Size factors: library size / median library size (matches legacy DCA)
+        median_counts = np.median(n_counts)
+        adata.obs['size_factors'] = n_counts / median_counts
 
         # Ensure float dtype prior to per-cell scaling to avoid casting issues
         adata.X = adata.X.astype(np.float32)
 
-        # Modern Scanpy normalization (replaces deprecated normalize_per_cell)
+        # Match the original DCA normalization (scanpy.normalize_per_cell default target_sum=1e4)
+        # while keeping compatibility with modern Scanpy.
         try:
             sc.pp.normalize_total(adata, target_sum=1e4, inplace=True, key_added=None)
         except TypeError:

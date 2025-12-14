@@ -7,6 +7,7 @@ import gc
 
 try:
     import keras
+    import tensorflow as tf
 except ImportError:
     raise ImportError('DCA requires keras 3+.')
 from .io import read_dataset, normalize
@@ -141,9 +142,6 @@ def dca(adata,
     are true, a tuple of anndata and model is returned in that order.
     """
 
-    gc.collect()
-    keras.backend.clear_session()
-
     assert isinstance(adata, anndata.AnnData), 'adata must be an AnnData instance'
     assert mode in ('denoise', 'latent'), '%s is not a valid mode.' % mode
 
@@ -152,6 +150,11 @@ def dca(adata,
     np.random.seed(random_state)
     # Use the provided random_state for Keras/TF seeding as well
     keras.utils.set_random_seed(random_state)
+    try:
+        tf.random.set_seed(random_state)
+        os.environ["PYTHONHASHSEED"] = str(random_state)
+    except Exception:
+        pass
 
     # this creates adata.raw with raw counts and copies adata if copy==True
     adata = read_dataset(adata,
@@ -206,6 +209,47 @@ def dca(adata,
     hist = train(train_adata, net, **training_kwds)
     res = net.predict(adata, mode, return_info, copy, batch_size=batch_size)
     adata = res if copy else adata
+
+    # --- Post-Processing: Failsafe for Extraction ---
+    # Sometimes _predict_info fails to populate adata.var/obsm due to shape mismatches or copy issues.
+    if return_info and 'zinb' in ae_type and mode == 'denoise':
+        
+        # 1. Failsafe for Dropout (Pi)
+        if "X_dca_dropout" not in adata.obsm.keys():
+             if verbose: print("DCA: Dropout (Pi) not found in output. Attempting manual extraction...")
+             try:
+                 if hasattr(net, 'extra_models') and 'pi' in net.extra_models:
+                     # Use net's internal helper to prep inputs exactly as it expects
+                     X_in, _ = net._prepare_inputs(adata)
+                     pi_pred = net.extra_models['pi'].predict(X_in, batch_size=batch_size, verbose=0)
+                     adata.obsm["X_dca_dropout"] = pi_pred
+                     if verbose: print("DCA: Manually extracted and saved dropout probabilities.")
+             except Exception as e:
+                 print(f"DCA: Manual dropout extraction failed: {e}")
+
+        # 2. Failsafe for Dispersion (Constant)
+        if "X_dca_dispersion" not in adata.obsm.keys() and "X_dca_dispersion" not in adata.var.keys():
+            if verbose: print("DCA: Dispersion not found in output. Attempting manual extraction...")
+            try:
+                # Check if it's a constant dispersion model
+                if hasattr(net, 'model'):
+                    # Try to find the dispersion layer
+                    disp_layer = net.model.get_layer("dispersion")
+                    if disp_layer:
+                        weights = disp_layer.get_weights()
+                        if len(weights) > 0:
+                            # Assume constant dispersion layer with shape (1, n_vars)
+                            theta_raw = weights[0]
+                            theta = np.squeeze(np.clip(np.exp(theta_raw), 1e-3, 1e4))
+                            
+                            # Assign to var if shapes match
+                            if theta.shape[0] == adata.n_vars:
+                                adata.var["X_dca_dispersion"] = theta
+                                if verbose: print("DCA: Manually extracted and saved constant dispersion.")
+            except Exception as e:
+                print(f"DCA: Manual dispersion extraction failed: {e}")
+
+    # -------------------------------------------------------
 
     if return_info:
         adata.uns['dca_loss_history'] = hist.history

@@ -24,12 +24,19 @@ import random
 
 from . import io
 from .network import AE_types
-from .loss import WrappedLoss, PackedNBLoss, PackedZINBLoss
+from .loss import (
+    WrappedLoss,
+    PackedNBLoss,
+    PackedZINBLoss,
+    packed_nb_loss_tf,
+    packed_zinb_loss_tf,
+)
 
 import numpy as np
 import scipy.sparse as sp
 
 import keras
+import tensorflow as tf
 from keras import optimizers as opt
 from keras.callbacks import EarlyStopping, ReduceLROnPlateau, TensorBoard, ModelCheckpoint
 import gc
@@ -54,15 +61,21 @@ def train(
     verbose=True,
     threads=None,
     **kwds
-):
-    # if threads:
-    #     try:
-    #         tf.config.threading.set_intra_op_parallelism_threads(int(threads))
-    #         tf.config.threading.set_inter_op_parallelism_threads(int(threads))
-    #     except Exception:
-    #         pass
+    ):
+    if threads:
+        try:
+            tf.config.threading.set_intra_op_parallelism_threads(int(threads))
+            tf.config.threading.set_inter_op_parallelism_threads(int(threads))
+        except Exception:
+            pass
         
     model = network.model
+    # Keras 3 sometimes accumulates zero-valued regularization losses on BatchNorm
+    # layers; clear them so loss selection stays simple.
+    try:
+        model._losses_override = []
+    except Exception:
+        pass
     if output_dir is not None:
         os.makedirs(output_dir, exist_ok=True)
 
@@ -84,17 +97,22 @@ def train(
         # ZINB models pack [mu, theta, pi] -> 3 * G
         output_dim = model.output_shape[-1]
         # Use network.output_size, as input_size might differ
-        genes_dim = network.output_size 
-        
+        genes_dim = network.output_size
+
         if output_dim == 2 * genes_dim:
-            loss_fn = PackedNBLoss()
+            # Use TF-native loss to avoid KerasTensor -> tf conversion issues
+            loss_fn = packed_nb_loss_tf
         elif output_dim == 3 * genes_dim:
             # Get ridge_lambda from the network object
             ridge = getattr(network, "ridge_lambda_for_loss", 0.0)
-            loss_fn = PackedZINBLoss(ridge_lambda=ridge)
+            loss_fn = lambda y_true, y_pred: packed_zinb_loss_tf(
+                y_true, y_pred, ridge_lambda=ridge
+            )
         else:
             # Fallback for models I didn't modify or non-std packing
-            print(f"Warning: Packed layer found but output dim {output_dim} doesn't match 2*G or 3*G (G={genes_dim}). Falling back to WrappedLoss.")
+            print(
+                f"Warning: Packed layer found but output dim {output_dim} doesn't match 2*G or 3*G (G={genes_dim}). Falling back to WrappedLoss."
+            )
             loss_fn = WrappedLoss(network.loss)
 
     model.compile(optimizer=optimizer, loss=loss_fn, run_eagerly=False, jit_compile=False)
@@ -141,8 +159,8 @@ def train(
     # This ensures consistency between training and prediction inputs.
     X, sf = network._prepare_inputs(adata)
 
-    # FIX Retracing: Use a list/tuple matching the Model definition order: [count, size_factors]
-    inputs = [X, sf]   
+    # FIX Retracing: Use a dict matching the Input layer names: {'count': ..., 'size_factors': ...}
+    inputs = {'count': X, 'size_factors': sf}
 
     y = adata.raw.X if use_raw_as_output else adata.X
     if sp.issparse(y):
@@ -187,12 +205,12 @@ def train_with_args(args):
     gc.collect()
     keras.backend.clear_session()
 
-    # if args.threads:
-    #     try:
-    #         tf.config.threading.set_intra_op_parallelism_threads(int(args.threads))
-    #         tf.config.threading.set_inter_op_parallelism_threads(int(args.threads))
-    #     except Exception:
-    #         pass
+    if args.threads:
+        try:
+            tf.config.threading.set_intra_op_parallelism_threads(int(args.threads))
+            tf.config.threading.set_inter_op_parallelism_threads(int(args.threads))
+        except Exception:
+            pass
 
     adata = io.read_dataset(
         args.input,
@@ -201,6 +219,16 @@ def train_with_args(args):
         test_split=args.testsplit,
     )
 
+    # Subset early if a gene list is provided to keep dimensions consistent
+    if args.denoisesubset:
+        genelist = io.read_genelist(args.denoisesubset)
+        missing = set(genelist) - set(adata.var_names.values)
+        assert not missing, "Gene list is not overlapping with genes from the dataset"
+        # Preserve the gene order provided by the user
+        adata = adata[:, genelist].copy()
+    else:
+        genelist = None
+
     adata = io.normalize(
         adata,
         size_factors=args.sizefactors,
@@ -208,15 +236,7 @@ def train_with_args(args):
         normalize_input=args.norminput,
     )
 
-    if args.denoisesubset:
-        genelist = list(set(io.read_genelist(args.denoisesubset)))
-        assert (
-            len(set(genelist) - set(adata.var_names.values)) == 0
-        ), "Gene list is not overlapping with genes from the dataset"
-        output_size = len(genelist)
-    else:
-        genelist = None
-        output_size = adata.n_vars
+    output_size = adata.n_vars
 
     hidden_size = [int(x) for x in args.hiddensize.split(",")]
     hidden_dropout = [float(x) for x in args.dropoutrate.split(",")]
@@ -262,19 +282,12 @@ def train_with_args(args):
         batch_size=args.batchsize,
         early_stop=args.earlystop,
         reduce_lr=args.reducelr,
-        output_subset=genelist,
+        output_subset=None,
         optimizer=args.optimizer,
         clip_grad=args.gradclip,
         save_weights=args.saveweights,
         tensorboard=args.tensorboard,
     )
 
-    if genelist:
-        predict_columns = adata.var_names[
-            [np.where(adata.var_names == x)[0][0] for x in genelist]
-        ]
-    else:
-        predict_columns = adata.var_names
-
     net.predict(adata, mode="full", return_info=True)
-    net.write(adata, args.outputdir, mode="full", colnames=predict_columns)
+    net.write(adata, args.outputdir, mode="full", colnames=adata.var_names)

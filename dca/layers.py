@@ -1,6 +1,7 @@
-# dca_patched/dca/layers.py
+# dca/layers.py
 from keras.layers import Layer, Dense, InputSpec
 from keras import ops
+import keras
 
 class ConstantDispersionLayer(Layer):
     """
@@ -27,7 +28,7 @@ class ConstantDispersionLayer(Layer):
         # x (B, G) is used only for shape inference.
         
         # Calculate the dispersion value (theta), clipped for stability.
-        # This MUST happen inside call() for gradient tracking.
+        # Match the original DCA bounds (exp(log-theta) clipped to [1e-3, 1e4]).
         theta = ops.clip(ops.exp(self.theta_raw), 1e-3, 1e4) # (1, G)
         
         # Broadcast to (B, G) using the dynamic shape of x.
@@ -41,8 +42,12 @@ class ElementwiseDense(Dense):
     def build(self, input_shape):
         assert len(input_shape) >= 2
         input_dim = input_shape[-1]
-        assert (input_dim == self.units) or (self.units == 1), \
-               "Input and output dims are not compatible"
+
+        # Ensure compatibility check handles Keras 3 dynamic shapes
+        if input_dim is not None:
+            if (input_dim != self.units) and (self.units != 1):
+                 raise ValueError(f"Input dim {input_dim} and output units {self.units} are not compatible for ElementwiseDense.")
+
         self.ew_kernel = self.add_weight(
             shape=(self.units,),
             initializer=self.kernel_initializer,
@@ -60,7 +65,11 @@ class ElementwiseDense(Dense):
             )
         else:
             self.ew_bias = None
-        self.input_spec = InputSpec(min_ndim=2, axes={-1: input_dim})
+        
+        if input_dim is not None:
+            self.input_spec = InputSpec(min_ndim=2, axes={-1: input_dim})
+        else:
+            self.input_spec = InputSpec(min_ndim=2)
         self.built = True
 
     def call(self, inputs):
@@ -68,7 +77,11 @@ class ElementwiseDense(Dense):
         if self.use_bias:
             out = out + self.ew_bias
         if self.activation is not None:
-            out = self.activation(out)
+            # Handle activation objects correctly
+            if isinstance(self.activation, str):
+                out = keras.activations.get(self.activation)(out)
+            else:
+                out = self.activation(out)
         return out
 
 # Coefficients for the Lanczos approximation (g=7)
@@ -90,7 +103,6 @@ def lgamma(x):
     Backend-agnostic log-gamma implementation using Lanczos approximation (g=7).
     Numerically stable and differentiable.
     """
-    # backend-agnostic (works on KerasTensors); no tf.* calls
     x = ops.cast(x, "float32")
     x = ops.maximum(x, ops.cast(1e-7, x.dtype))  # avoid poles
     z = x - 1.0
@@ -105,5 +117,3 @@ def lgamma(x):
             + ops.log(a)
             + (z + 0.5) * ops.log(t)
             - t)
-
-# ColwiseMultLayer = Lambda(lambda l: ops.multiply(l[0], ops.reshape(l[1], (-1, 1))))
